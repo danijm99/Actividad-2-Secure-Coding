@@ -1,249 +1,228 @@
-# Paso 12 — Race Condition / TOCTOU
-**Tecnologia:** Go | **OWASP:** A01:2021 - Broken Access Control | **CWE-367**
+# Paso 13 — ReDoS (Regular Expression Denial of Service)
+**Tecnologia:** Go | **OWASP:** A06:2021 - Vulnerable and Outdated Components / DoS | **CWE-1333**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Time-of-Check to Time-of-Use (TOCTOU) es una race condition donde una aplicacion verifica una condicion (check) y luego actua en base a ella (use), pero entre ambas operaciones otro proceso o goroutine puede modificar el estado del sistema, invalidando la verificacion.
+ReDoS (Regular Expression Denial of Service) ocurre cuando un motor de expresiones regulares tarda un tiempo exponencial o cuadratico en evaluar un input especialmente diseñado contra ciertos patrones. Esto se debe al "backtracking catastrofico": el motor intenta todas las combinaciones posibles de matching antes de concluir que el input no coincide.
 
-El problema fundamental es que la combinacion de dos operaciones atomicas individuales no es, en si misma, atomica. Hay una ventana temporal entre el "check" y el "use" que puede ser aprovechada.
+El problema surge cuando el patron tiene:
+1. Cuantificadores anidados: `(a+)+`, `(a|aa)+`, `(a+b)+`
+2. Alternaciones con prefijos comunes: `(cat|catch|ca)+`
+3. Grupos que se solapan entre si
 
-En sistemas de archivos esto es critico: un archivo puede ser creado, movido o reemplazado por un enlace simbolico entre que se verifica su existencia y se crea. En sistemas de alta concurrencia (servidores web), incluso ventanas de microsegundos pueden ser explotadas con ataques de alta frecuencia.
+Con un input como `aaaaaaaaaaaaaaaaaaaaX` (muchas `a` seguidas de una letra que fuerza el fallo), el motor explora 2^n combinaciones para n caracteres, bloqueando el thread o proceso durante segundos o minutos con un solo request.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/go/handlers/upload.go`
+**Archivo:** `src/go/handlers/search.go`
 
 ```go
 // CODIGO VULNERABLE — estado actual del ejercicio
-func UploadHandler(w http.ResponseWriter, r *http.Request) {
-    filename := r.FormValue("name")
-    path := filepath.Join(uploadDir, filename)
+var emailPattern = regexp.MustCompile(`^(([a-zA-Z]+)+)@example\.com$`)
 
-    // CHECK: verificar si el archivo existe
-    if _, err := os.Stat(path); err == nil {
-        http.Error(w, "File already exists", http.StatusConflict)
-        return
+func SearchHandler(w http.ResponseWriter, r *http.Request) {
+    input := r.URL.Query().Get("q")
+    if emailPattern.MatchString(input) {
+        w.Write([]byte("valid"))
     }
-
-    // ------- VENTANA TOCTOU: otro goroutine puede crear el archivo aqui -------
-
-    // USE: crear el archivo (puede sobrescribir uno creado en la ventana)
-    f, _ := os.Create(path)
-    defer f.Close()
-    io.Copy(f, r.Body)
 }
 ```
 
-La ventana TOCTOU esta entre `os.Stat()` y `os.Create()`. En un servidor web con goroutines concurrentes, dos peticiones simultaneas para el mismo filename pasaran ambas el check de `os.Stat` (el archivo no existe) y ambas llegaran a `os.Create`, donde la segunda sobrescribira el archivo creado por la primera.
+El patron `(([a-zA-Z]+)+)` es vulnerable porque:
+- El grupo externo `(...)+` puede matchear una o mas veces
+- El grupo interno `[a-zA-Z]+` tambien puede matchear una o mas veces
+- Ambos grupos pueden repartirse los mismos caracteres de infinitas formas
 
-Ademas, `filename` no esta validado: un atacante puede enviar `../../../etc/cron.d/backdoor` como nombre de archivo.
+Con input `aaaaaaaaaaaaaaaaaaaaX`, el motor intenta todas las formas de dividir las `a` entre los dos grupos antes de fallar en la `X`. El tiempo crece exponencialmente con la longitud del input.
+
+**Nota Go:** el paquete `regexp` de Go usa una implementacion NFA que evita el backtracking catastrofico. Sin embargo, el patron vulnerable aqui sirve como ejemplo del problema que es critico en otros lenguajes (Python `re`, JavaScript, Java, Ruby, PHP) y en dependencias de terceros.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Path Traversal via nombre de archivo:**
+**Input que provoca backtracking catastrofico (en motores con backtracking):**
 ```
-POST /upload
-name=../../../etc/cron.d/evil-job
-[cuerpo: script de cron malicioso]
+GET /search?q=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX
 ```
 
-Sobrescribe un archivo de cron del sistema si el proceso tiene permisos suficientes.
-
-**TOCTOU para sobrescribir archivos existentes:**
-```bash
-# El atacante lanza dos peticiones concurrentes para el mismo archivo
-curl -X POST /upload -d "name=config.json" -d @config.json &
-curl -X POST /upload -d "name=config.json" -d @malicious.json &
-# Una de ellas pasara el check y sobrescribira el archivo legiti
+En Python con el mismo patron:
+```python
+import re, time
+pattern = re.compile(r'^(([a-zA-Z]+)+)@example\.com$')
+start = time.time()
+pattern.match('a' * 30 + 'X')  # tarda >30 segundos con 30 caracteres
+print(time.time() - start)
 ```
 
-**Symlink attack:**
-```bash
-# Mientras la aplicacion ejecuta os.Stat() y antes de os.Create()
-# el atacante crea un symlink que apunta a un archivo sensible
-ln -s /etc/passwd /var/uploads/target.txt
-# La siguiente os.Create() seguira el symlink y sobrescribira /etc/passwd
-```
+**Numero de intentos necesario para DoS:**
+- 20 caracteres: ~1 segundo
+- 25 caracteres: ~30 segundos
+- 30 caracteres: >10 minutos
+- Con 3 peticiones concurrentes, el servidor queda inutilizable
+
+**Bibliotecas vulnerables frecuentes:**
+- `validator.js` (npm): tuvo multiples CVEs de ReDoS en validaciones de email/URL
+- `moment.js`: CVE-2022-24785 (ReDoS en parsing de fechas)
+- `express-fileupload`: CVE-2020-7699
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/go/handlers/upload.go` para usar una operacion atomica que elimina la ventana TOCTOU:
+Modifica `src/go/handlers/search.go` para usar un patron sin backtracking catastrofico y limitar la longitud del input:
 
 ```go
 // CODIGO SEGURO
 package handlers
 
 import (
-    "io"
     "net/http"
-    "os"
-    "path/filepath"
+    "regexp"
 )
 
-const uploadDir = "/var/uploads"
+const maxInputLength = 254  // longitud maxima de email segun RFC 5321
 
-func UploadHandler(w http.ResponseWriter, r *http.Request) {
-    // Usar solo el nombre base del archivo (elimina path traversal)
-    filename := filepath.Base(r.FormValue("name"))
-    if filename == "." || filename == "" {
-        http.Error(w, "Invalid filename", http.StatusBadRequest)
+// Patron lineal: sin cuantificadores anidados, sin alternaciones con prefijo comun
+// [a-zA-Z0-9._%+\-]+ matchea una vez por caracter, sin posibilidad de repartir
+var safeEmailPattern = regexp.MustCompile(
+    `^[a-zA-Z0-9._%+\-]+@example\.com$`,
+)
+
+func SearchHandler(w http.ResponseWriter, r *http.Request) {
+    input := r.URL.Query().Get("q")
+
+    // Limitar longitud antes de evaluar la regex
+    if len(input) > maxInputLength {
+        http.Error(w, "Input too long", http.StatusBadRequest)
         return
     }
-    path := filepath.Join(uploadDir, filename)
 
-    // O_CREATE|O_EXCL es atomico: crea el archivo SOLO si no existe.
-    // Si ya existe, falla con error. No hay ventana entre check y create.
-    f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-    if err != nil {
-        if os.IsExist(err) {
-            http.Error(w, "File already exists", http.StatusConflict)
-        } else {
-            http.Error(w, "Internal error", http.StatusInternalServerError)
-        }
-        return
+    if safeEmailPattern.MatchString(input) {
+        w.Write([]byte("valid"))
+    } else {
+        w.Write([]byte("invalid"))
     }
-    defer f.Close()
-    io.Copy(f, r.Body)
-    w.WriteHeader(http.StatusCreated)
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`O_CREATE|O_EXCL` atomico:** a nivel de kernel, `open(2)` con `O_CREAT|O_EXCL` es atomico. El kernel verifica y crea en una sola operacion indivisible. No hay ventana entre el check y el create. Si el archivo ya existe, `open()` falla con `EEXIST`.
-- **`filepath.Base()`:** extrae solo el nombre del archivo de la ruta proporcionada, descartando cualquier componente de directorio. `../../../etc/passwd` se convierte en `passwd`. Previene path traversal.
-- **Manejo explicito de errores:** distinguir `os.IsExist` de otros errores permite respuestas HTTP apropiadas sin exponer informacion interna.
+- **Patron lineal `[a-zA-Z0-9._%+\-]+`:** cada posicion del input solo puede ser matcheada de una forma. No hay forma de "repartir" los caracteres entre grupos anidados. El motor evalua cada caracter exactamente una vez: complejidad O(n).
+- **Limite de longitud:** incluso con un patron potencialmente lento, limitar el input a 254 caracteres pone un techo al tiempo de evaluacion. Es la primera linea de defensa ante cualquier patron desconocido.
+- **Sin cuantificadores anidados:** la regla es: nunca `(X+)+`, nunca `(X|Y)+` donde X e Y comparten prefijos, nunca grupos que se solapan.
 
 ---
 
-## Variantes de la misma categoria (Race Conditions — mas complejas)
+## Variantes de la misma categoria (DoS via logica vulnerable — mas complejas)
 
-### Variante A: Double-Spend Race Condition en transferencias
+### Variante A: ReDoS en validacion de URL (JavaScript/Node.js)
 
-```python
-# VULNERABLE — check de saldo y debito no son atomicos
-@router.post("/transfer")
-async def transfer(amount: int, to_account: str, user=Depends(get_current_user)):
-    balance = db.get_balance(user.id)    # CHECK: leer saldo
-    if balance < amount:
-        raise HTTPException(status_code=400, detail="Saldo insuficiente")
-    # VENTANA: otra peticion puede leer el mismo saldo aqui
-    db.debit(user.id, amount)            # USE: debitar
-    db.credit(to_account, amount)
+```javascript
+// VULNERABLE — patron con backtracking catastrofico en validacion de URL
+const URL_PATTERN = /^(https?:\/\/)?(([a-zA-Z\d]([a-zA-Z\d-]*[a-zA-Z\d])*)\.)+[a-zA-Z]{2,}$/;
+
+app.get('/validate', (req, res) => {
+    const url = req.query.url;
+    // Con input como 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
+    // el motor tarda exponencialmente
+    res.json({ valid: URL_PATTERN.test(url) });
+});
 ```
 
-Un atacante envia dos peticiones de transferencia de 100 EUR con saldo de 100 EUR simultaneamente. Ambas pasan el check de saldo, y ambas debitan 100 EUR, dejando la cuenta en -100 EUR.
-
-```python
-# SEGURO — transaccion con SELECT FOR UPDATE (bloqueo pesimista)
-@router.post("/transfer")
-async def transfer(amount: int, to_account: str, user=Depends(get_current_user)):
-    async with db.transaction():
-        # SELECT FOR UPDATE bloquea la fila hasta que la transaccion termine
-        balance = await db.execute(
-            "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE",
-            user.id
-        )
-        if balance < amount:
-            raise HTTPException(status_code=400)
-        await db.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, user.id)
-        await db.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", amount, to_account)
-```
-
----
-
-### Variante B: TOCTOU en verificacion de autorizacion
-
-```go
-// VULNERABLE — verificar permisos y luego actuar en operaciones separadas
-func DeleteHandler(w http.ResponseWriter, r *http.Request) {
-    fileID := r.URL.Query().Get("id")
-
-    // CHECK: verificar que el usuario es propietario
-    owner := db.GetFileOwner(fileID)
-    if owner != currentUser {
-        http.Error(w, "Forbidden", http.StatusForbidden)
-        return
+```javascript
+// SEGURO — usar la clase URL nativa del runtime (sin backtracking)
+app.get('/validate', (req, res) => {
+    const rawUrl = req.query.url;
+    if (rawUrl.length > 2048) {
+        return res.status(400).json({ error: 'URL too long' });
     }
-
-    // VENTANA: entre el check y el borrado, la propiedad puede cambiar
-    // (ej: el archivo es transferido a otro usuario)
-
-    // USE: borrar el archivo
-    db.DeleteFile(fileID)
-}
-```
-
-```go
-// SEGURO — verificacion y accion en una sola query atomica
-func DeleteHandler(w http.ResponseWriter, r *http.Request) {
-    fileID := r.URL.Query().Get("id")
-    // DELETE WHERE filtra por propiedad atomicamente
-    affected := db.Exec(
-        "DELETE FROM files WHERE id = $1 AND owner_id = $2",
-        fileID, currentUser,
-    )
-    if affected == 0 {
-        http.Error(w, "Not found or forbidden", http.StatusNotFound)
-        return
+    try {
+        const parsed = new URL(rawUrl);  // parser nativo, no regex
+        const valid = ['http:', 'https:'].includes(parsed.protocol);
+        res.json({ valid });
+    } catch {
+        res.json({ valid: false });
     }
-    w.WriteHeader(http.StatusOK)
-}
+});
 ```
 
 ---
 
-### Variante C: Race Condition en generacion de nombres de archivo temporales
+### Variante B: Catastrophic Backtracking en validacion de fechas (Python)
 
 ```python
-# VULNERABLE — crear archivo temporal con nombre predecible
-import os, time
-
-def process_upload(content: bytes) -> str:
-    tmpfile = f"/tmp/upload_{int(time.time())}"  # nombre predecible
-    if os.path.exists(tmpfile):                  # TOCTOU check
-        raise Exception("Temp file exists")
-    with open(tmpfile, 'wb') as f:               # TOCTOU use
-        f.write(content)
-    return tmpfile
+# VULNERABLE — validacion de fecha con alternacion que causa backtracking
+DATE_PATTERN = re.compile(
+    r'^(\d{4})[-/.](\d{1,2}|0[1-9]|1[0-2])[-/.](\d{1,2}|0[1-9]|[12]\d|3[01])$'
+)
 ```
 
-```python
-# SEGURO — usar tempfile del sistema que garantiza atomicidad y nombre unico
-import tempfile
+Este patron tiene alternaciones `(\d{1,2}|0[1-9]|1[0-2])` con prefijos comunes (todos pueden empezar por un digito). Con input `1999-99-99999999999X`, el backtracking es cuadratico.
 
-def process_upload(content: bytes) -> str:
-    # mkstemp crea el archivo atomicamente con nombre unico e impredecible
-    fd, tmpfile = tempfile.mkstemp(prefix="upload_", dir="/var/tmp")
-    try:
-        os.write(fd, content)
-    finally:
-        os.close(fd)
-    return tmpfile
+```python
+# SEGURO — patron sin alternaciones solapadas + longitud fija
+DATE_PATTERN = re.compile(r'^\d{4}[-/.]\d{2}[-/.]\d{2}$')
+
+def validate_date(date_str: str) -> bool:
+    if len(date_str) > 10:
+        return False
+    if not DATE_PATTERN.match(date_str):
+        return False
+    # Validacion logica post-regex (mes 1-12, dia 1-31)
+    parts = re.split(r'[-/.]', date_str)
+    month, day = int(parts[1]), int(parts[2])
+    return 1 <= month <= 12 and 1 <= day <= 31
+```
+
+---
+
+### Variante C: Amplification via compresion (zip bomb) — DoS de otro tipo
+
+```python
+# VULNERABLE — descomprimir sin limitar el taman~o del output
+import zipfile
+
+@router.post("/extract")
+async def extract(file: UploadFile):
+    with zipfile.ZipFile(file.file) as z:
+        total = sum(info.file_size for info in z.infolist())
+        z.extractall("/tmp/output")  # puede descomprimir GBs desde pocos KB
+```
+
+Un zip bomb como `42.zip` (42 KB) se expande a 4.5 PB de datos anidados.
+
+```python
+# SEGURO — limitar taman~o total antes de extraer
+MAX_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MB
+
+@router.post("/extract")
+async def extract(file: UploadFile):
+    with zipfile.ZipFile(file.file) as z:
+        total = sum(info.file_size for info in z.infolist())
+        if total > MAX_UNCOMPRESSED:
+            raise HTTPException(status_code=400, detail="Archivo demasiado grande")
+        z.extractall("/tmp/output")
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
-- [CWE-367: TOCTOU Race Condition](https://cwe.mitre.org/data/definitions/367.html)
-- [CWE-362: Concurrent Execution with Shared Resource (Race Condition)](https://cwe.mitre.org/data/definitions/362.html)
-- [Linux man page - open(2) con O_EXCL](https://man7.org/linux/man-pages/man2/open.2.html)
+- [OWASP CWE-1333: ReDoS](https://cwe.mitre.org/data/definitions/1333.html)
+- [PortSwigger - ReDoS](https://portswigger.net/web-security/essential-skills/obfuscating-attacks-using-encodings)
+- [OWASP ReDoS article](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
+- [CVE-2022-24785 — ReDoS en moment.js](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-24785)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 12** exige que `src/go/handlers/upload.go` contenga:
-- `filepath.Base`
-- `os.OpenFile` con `O_CREATE|O_EXCL|O_WRONLY`
-- La ausencia de `os.Create(path)`
+El workflow **Validate Step 13** exige que `src/go/handlers/search.go` contenga:
+- `safeEmailPattern`
+- El limite de longitud del input
+- La desaparicion del patron vulnerable
