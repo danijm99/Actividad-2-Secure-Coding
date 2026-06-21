@@ -1,189 +1,205 @@
-# Paso 10 — Cross-Site Request Forgery (CSRF)
-**Tecnologia:** Java / Spring Boot | **OWASP:** A01:2021 - Broken Access Control | **CWE-352**
+# Paso 11 — HTTP Header Injection
+**Tecnologia:** Go | **OWASP:** A03:2021 - Injection | **CWE-113**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-CSRF (Cross-Site Request Forgery) es un ataque donde un sitio malicioso fuerza al navegador de la victima a ejecutar peticiones autenticadas contra una aplicacion en la que el usuario ya tiene sesion activa. El servidor no puede distinguir una peticion legitima del usuario de una forzada por el atacante, porque ambas llegan con las mismas cookies de sesion.
+HTTP Header Injection (tambien llamada Response Splitting) ocurre cuando una aplicacion escribe en un header HTTP un valor controlado por el usuario sin eliminar los caracteres de control `\r` (CR) y `\n` (LF). En el protocolo HTTP, la secuencia `\r\n` separa los headers de la respuesta. Inyectando esta secuencia, un atacante puede:
 
-El mecanismo de ataque es el siguiente: el navegador incluye automaticamente las cookies del dominio destino en cualquier peticion hacia ese dominio, independientemente del origen de la pagina que inicia la peticion. Si un sitio en `evil.com` hace un formulario con `action="https://banco.com/transferencia"`, el navegador enviara las cookies del usuario en `banco.com`.
+- Anadir headers arbitrarios a la respuesta (ej: `Set-Cookie` fraudulento)
+- Dividir la respuesta HTTP en dos y controlar el cuerpo de la segunda
+- Envenenar caches HTTP intermedias (cache poisoning)
+- Forzar descargas de archivos maliciosos con `Content-Disposition`
 
-CSRF afecta principalmente a aplicaciones que usan cookies para autenticacion (en oposicion a tokens Bearer en el header `Authorization`). Es especialmente grave en acciones de alto impacto: cambio de email, cambio de contrasena, transferencias bancarias, borrado de datos.
+El header mas vulnerable es `Location` en redirecciones, porque acepta URLs que pueden contener caracteres codificados que al decodificar incluyen `%0d%0a` (\r\n).
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/java/src/main/java/com/example/api/controller/SecurityConfig.java`
+**Archivo:** `src/go/handlers/headers.go`
 
-```java
+```go
 // CODIGO VULNERABLE — estado actual del ejercicio
-@Bean
-public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
-    http.csrf(csrf -> csrf.disable())  // proteccion CSRF completamente deshabilitada
-        .authorizeHttpRequests(auth -> auth.anyRequest().authenticated());
-    return http.build();
+func RedirectHandler(w http.ResponseWriter, r *http.Request) {
+    next := r.URL.Query().Get("next")  // input del usuario
+    w.Header().Set("Location", next)  // escribe next directamente en el header
+    w.WriteHeader(http.StatusFound)
 }
 ```
 
-Con `csrf.disable()`, Spring Security no requiere ni verifica tokens CSRF en ningun endpoint. Cualquier peticion con metodos POST, PUT, DELETE sera aceptada si llega con una cookie de sesion valida, sin importar el origen.
+Al escribir `next` directamente en el header `Location`, si `next` contiene `\r\n`, el servidor emite dos headers donde deberia haber uno. El cliente HTTP o el navegador puede interpretar lo que viene despues de `\r\n` como un header adicional de la respuesta.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Escenario:** el usuario esta autenticado en `app.empresa.com`. El atacante crea esta pagina en `evil.com`:
-
-```html
-<!-- evil.com/csrf-attack.html -->
-<html>
-<body>
-  <!-- Formulario invisible que se envia automaticamente al cargar la pagina -->
-  <form id="attack" action="https://app.empresa.com/api/user/email" method="POST">
-    <input type="hidden" name="newEmail" value="attacker@evil.com">
-  </form>
-  <script>document.getElementById('attack').submit();</script>
-</body>
-</html>
+**Inyeccion de Set-Cookie fraudulento:**
+```
+GET /redirect?next=/home%0d%0aSet-Cookie:+session=attacker_session%3B+Path%3D%2F
 ```
 
-Cuando la victima visita `evil.com/csrf-attack.html`, su navegador envia automaticamente la peticion POST a `app.empresa.com` con las cookies de sesion activas. El email del usuario queda cambiado al del atacante, que puede entonces hacer un reset de contrasena y tomar la cuenta.
+La respuesta HTTP generada seria:
+```
+HTTP/1.1 302 Found
+Location: /home
+Set-Cookie: session=attacker_session; Path=/
+```
 
-**Ataque via img tag (peticiones GET):**
-```html
-<img src="https://app.empresa.com/api/user/delete-account">
+El navegador de la victima sobrescribe su cookie de sesion con la del atacante (session fixation).
+
+**Cache Poisoning via response splitting:**
+```
+GET /redirect?next=%0d%0aHTTP/1.1+200+OK%0d%0aContent-Type:+text/html%0d%0a%0d%0a<script>alert(1)</script>
+```
+
+Un proxy intermedio puede cachear la segunda "respuesta" manufacturada y servir el XSS a usuarios posteriores.
+
+**Inyeccion de Content-Type para forzar descarga:**
+```
+GET /redirect?next=/file%0d%0aContent-Disposition:+attachment%3B+filename%3Dmalware.exe
 ```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `SecurityConfig.java` para habilitar CSRF con `CookieCsrfTokenRepository`:
+Modifica `src/go/handlers/headers.go` para sanitizar el valor del header y usar allowlist de destinos:
 
-```java
+```go
 // CODIGO SEGURO
-import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
+package handlers
 
-@Configuration
-@EnableWebSecurity
-public class SecurityConfig {
+import (
+    "net/http"
+    "strings"
+)
 
-    @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
-        http
-            // CSRF habilitado con token en cookie accesible al frontend del mismo origen
-            .csrf(csrf -> csrf
-                .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
-            )
-            .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/api/public/**").permitAll()
-                .anyRequest().authenticated()
-            );
-        return http.build();
+var allowedRedirects = map[string]bool{
+    "/home":      true,
+    "/dashboard": true,
+    "/profile":   true,
+}
+
+// sanitizeHeaderValue elimina caracteres de control del valor de un header
+func sanitizeHeaderValue(value string) string {
+    value = strings.ReplaceAll(value, "\r", "")
+    value = strings.ReplaceAll(value, "\n", "")
+    return value
+}
+
+func RedirectHandler(w http.ResponseWriter, r *http.Request) {
+    next := r.URL.Query().Get("next")
+    sanitized := sanitizeHeaderValue(next)
+
+    // Allowlist: solo redirigir a rutas internas conocidas
+    if !allowedRedirects[sanitized] {
+        sanitized = "/home"
     }
+
+    w.Header().Set("Location", sanitized)
+    w.WriteHeader(http.StatusFound)
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`CookieCsrfTokenRepository`:** Spring escribe el token CSRF en una cookie `XSRF-TOKEN`. El frontend JavaScript del mismo origen puede leerla y enviarla en el header `X-XSRF-TOKEN` con cada peticion.
-- **`withHttpOnlyFalse()`:** permite que JavaScript lea la cookie `XSRF-TOKEN`. Sin esto, el frontend no podria leer el token para incluirlo en las peticiones. La cookie de sesion principal sigue siendo `HttpOnly`.
-- **Proteccion Double Submit Cookie:** el servidor verifica que el valor en el header `X-XSRF-TOKEN` coincida con el token de la sesion. Un atacante en `evil.com` no puede leer la cookie `XSRF-TOKEN` del usuario (bloqueado por Same-Origin Policy) y por tanto no puede incluir el header correcto.
+- **`sanitizeHeaderValue`:** elimina `\r` y `\n` del valor antes de escribirlo en el header. Sin estos caracteres, es imposible inyectar headers adicionales o dividir la respuesta.
+- **Allowlist de destinos:** aunque la sanitizacion sea suficiente para prevenir header injection, la allowlist garantiza ademas que no se puede hacer open redirect. Defense in depth.
+- **Destino seguro por defecto:** si `sanitized` no esta en la allowlist, la redireccion va a `/home`. El atacante no recibe error descriptivo.
 
 ---
 
-## Variantes de la misma categoria (CSRF / Broken Access Control — mas complejas)
+## Variantes de la misma categoria (Injection en headers y protocolos — mas complejas)
 
-### Variante A: CSRF con Content-Type JSON (SameSite bypass)
+### Variante A: HTTP Request Smuggling (CL.TE / TE.CL)
 
-Algunas APIs solo aceptan peticiones `Content-Type: application/json`, asumiendo que el navegador no puede enviar ese tipo desde un formulario externo. Esto es incorrecto en contextos modernos:
+HTTP Request Smuggling ocurre cuando un proxy frontend y el servidor backend interpretan de forma diferente donde termina una peticion HTTP, permitiendo al atacante "contrabandear" una peticion dentro de otra.
 
-```javascript
-// VULNERABLE — asumir que JSON content-type previene CSRF
-// El servidor acepta la peticion si el Content-Type es application/json
-// Un atacante puede enviarla via fetch desde evil.com:
-fetch('https://app.empresa.com/api/transfer', {
-    method: 'POST',
-    credentials: 'include',   // envia cookies
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ amount: 9999, to: 'attacker' })
-});
-// El preflight CORS puede fallar, pero con una CORS misconfiguration, pasa.
+```
+# ATAQUE CL.TE: frontend usa Content-Length, backend usa Transfer-Encoding
+POST / HTTP/1.1
+Host: empresa.com
+Content-Length: 13
+Transfer-Encoding: chunked
+
+0
+
+GET /admin HTTP/1.1
+Host: empresa.com
 ```
 
-```java
-// SEGURO — combinar CSRF token + verificacion de Origin header
-// Verificar que Origin o Referer corresponde al dominio propio
-@Component
-public class OriginVerificationFilter extends OncePerRequestFilter {
-    @Override
-    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
-            throws ServletException, IOException {
-        String origin = req.getHeader("Origin");
-        if (origin != null && !origin.equals("https://app.empresa.com")) {
-            res.sendError(HttpServletResponse.SC_FORBIDDEN);
-            return;
-        }
-        chain.doFilter(req, res);
-    }
+El frontend envia la peticion completa como un POST. El backend, usando Transfer-Encoding, procesa el `0\r\n\r\n` como fin del cuerpo, y trata `GET /admin HTTP/1.1` como el inicio de la siguiente peticion del atacante.
+
+**Mitigacion:** normalizar todos los headers en el proxy, rechazar peticiones con ambos headers `Content-Length` y `Transfer-Encoding`, o usar HTTP/2 que no tiene este problema.
+
+---
+
+### Variante B: Host Header Injection (Password Reset Poisoning)
+
+```go
+// VULNERABLE — usar el header Host para construir URLs en emails
+func PasswordResetHandler(w http.ResponseWriter, r *http.Request) {
+    host := r.Host  // controlado por el cliente
+    token := generateResetToken()
+    resetURL := fmt.Sprintf("https://%s/reset?token=%s", host, token)
+    sendResetEmail(email, resetURL)  // el link del email apunta al host del atacante
+}
+```
+
+El atacante modifica el header `Host: evil.com` en la peticion de reset. El email enviado a la victima contiene el link `https://evil.com/reset?token=TOKEN`. Cuando la victima hace clic, envia el token al servidor del atacante.
+
+```go
+// SEGURO — usar una URL base configurada, nunca el header Host
+var baseURL = os.Getenv("APP_BASE_URL")  // "https://app.empresa.com"
+
+func PasswordResetHandler(w http.ResponseWriter, r *http.Request) {
+    token := generateResetToken()
+    resetURL := fmt.Sprintf("%s/reset?token=%s", baseURL, token)
+    sendResetEmail(email, resetURL)
 }
 ```
 
 ---
 
-### Variante B: Login CSRF (forzar sesion del atacante en el navegador de la victima)
+### Variante C: Content-Type Sniffing via header injection
 
-```java
-// VULNERABLE — endpoint de login sin proteccion CSRF
-// Un atacante puede forzar al navegador de la victima a iniciar sesion
-// con las credenciales del atacante
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
-    // autenticar y crear sesion
+```go
+// VULNERABLE — Content-Type del archivo derivado del input del usuario
+func DownloadHandler(w http.ResponseWriter, r *http.Request) {
+    mimeType := r.URL.Query().Get("type")  // controlado por el usuario
+    w.Header().Set("Content-Type", mimeType)  // inyeccion posible
+    w.Write(fileContent)
 }
 ```
 
-Payload: la victima visita `evil.com` que tiene un formulario que hace submit automatico a `/login` con credenciales del atacante. La victima queda logada como el atacante sin saberlo. Todo lo que la victima hace (subir documentos, realizar compras) queda en la cuenta del atacante.
+El atacante puede inyectar `Content-Type: text/html\r\n` y convertir una descarga de archivo en una pagina HTML renderizable, posibilitando XSS.
 
-```java
-// SEGURO — CSRF token tambien en el formulario de login (aunque el usuario no este autenticado)
-// Spring Security aplica CSRF por defecto a todos los metodos POST, incluyendo /login
-// Solo debe deshabilitarse si se usa autenticacion stateless con JWT en header
+```go
+// SEGURO — detectar MIME del contenido real, nunca del parametro
+func DownloadHandler(w http.ResponseWriter, r *http.Request) {
+    mimeType := http.DetectContentType(fileContent)  // basado en los bytes reales
+    w.Header().Set("Content-Type", mimeType)
+    w.Header().Set("X-Content-Type-Options", "nosniff")  // previene sniffing en IE
+    w.Write(fileContent)
+}
 ```
-
----
-
-### Variante C: CSRF bypass via SameSite=None en cookies de terceros
-
-```
-# VULNERABLE — configurar cookies de sesion con SameSite=None sin Secure
-Set-Cookie: JSESSIONID=abc123; SameSite=None
-```
-
-`SameSite=None` permite que la cookie se envie en peticiones cross-site. Sin `Secure`, ademas viaja por HTTP.
-
-```
-# SEGURO — usar SameSite=Strict o SameSite=Lax con el token CSRF como defensa en profundidad
-Set-Cookie: JSESSIONID=abc123; HttpOnly; Secure; SameSite=Strict
-```
-
-Con `SameSite=Strict`, el navegador no envia la cookie en peticiones cross-site, eliminando CSRF sin necesidad de token. Sin embargo, CSRF token sigue siendo recomendado como defensa en profundidad ante bugs de implementacion `SameSite`.
 
 ---
 
 ## Referencias
 
-- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
-- [CWE-352: CSRF](https://cwe.mitre.org/data/definitions/352.html)
-- [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
-- [Spring Security - CSRF](https://docs.spring.io/spring-security/reference/features/exploits/csrf.html)
+- [OWASP A03:2021 - Injection](https://owasp.org/Top10/A03_2021-Injection/)
+- [CWE-113: HTTP Response Splitting](https://cwe.mitre.org/data/definitions/113.html)
+- [PortSwigger - HTTP request smuggling](https://portswigger.net/web-security/request-smuggling)
+- [PortSwigger - Host header injection](https://portswigger.net/web-security/host-header)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 10** exige que `SecurityConfig.java` contenga:
-- `CookieCsrfTokenRepository`
-- `EnableWebSecurity`
-- La ausencia de `csrf.disable()`
+El workflow **Validate Step 11** exige que `src/go/handlers/headers.go` contenga:
+- `sanitizeHeaderValue`
+- `allowedRedirects`
+- El uso del valor saneado en `Location`
