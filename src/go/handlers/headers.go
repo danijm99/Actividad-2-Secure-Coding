@@ -32,13 +32,12 @@ func sanitizeHeaderValue(value string) string {
 
 func RedirectHandler(w http.ResponseWriter, r *http.Request) {
 	next := r.URL.Query().Get("next")
+	
+	safe := sanitizeHeaderValue(next)
 
-	sanitized := sanitizeHeaderValue(next)
-
-	if !allowedRedirects[sanitized] {
-		sanitized = "/home"
+	if !allowedRedirects[safe] {
+		safe = "/home"
 	}
 
-	w.Header().Set("Location", sanitized)
+	w.Header().Set("Location", safe)
 	w.WriteHeader(http.StatusFound)
-}
