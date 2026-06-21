@@ -9,10 +9,13 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
+import java.io.StringReader;
+
 @RestController
 @RequestMapping("/api/xml")
 public class XmlController {
@@ -31,11 +34,25 @@ public class XmlController {
     // <data>&xxe;</data>
     // El servidor leera /etc/passwd y lo incluira en la respuesta.
 
-    @PostMapping("/parse")
+@PostMapping("/parse")
     public ResponseEntity<?> parseXml(@RequestBody String xmlInput) throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        
+        // ✅ CORRECCIÓN 1: Deshabilitar DOCTYPE completamente (la opción más segura)
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+
+        // ✅ CORRECCIÓN 2: Deshabilitar entidades externas generales y de parámetro
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+
+        // ✅ CORRECCIÓN 3: Deshabilitar la carga de DTDs externas y desactivar XInclude
+        factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+
         DocumentBuilder builder = factory.newDocumentBuilder();
         Document doc = builder.parse(new ByteArrayInputStream(xmlInput.getBytes()));
+        
         return ResponseEntity.ok(doc.getDocumentElement().getTagName());
     }
 }
