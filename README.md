@@ -1,228 +1,239 @@
-# Paso 13 — ReDoS (Regular Expression Denial of Service)
-**Tecnologia:** Go | **OWASP:** A06:2021 - Vulnerable and Outdated Components / DoS | **CWE-1333**
+# Paso 14 — Timing Attack
+**Tecnologia:** Go | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-208**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-ReDoS (Regular Expression Denial of Service) ocurre cuando un motor de expresiones regulares tarda un tiempo exponencial o cuadratico en evaluar un input especialmente diseñado contra ciertos patrones. Esto se debe al "backtracking catastrofico": el motor intenta todas las combinaciones posibles de matching antes de concluir que el input no coincide.
+Un timing attack es un ataque de canal lateral donde el atacante mide el tiempo que tarda un servidor en procesar una peticion para deducir informacion sobre datos secretos. El principio se basa en que las operaciones de comparacion de strings en la mayoria de lenguajes terminan en el primer byte diferente: cuantos bytes coincidan al inicio, mas tiempo tarda la comparacion.
 
-El problema surge cuando el patron tiene:
-1. Cuantificadores anidados: `(a+)+`, `(a|aa)+`, `(a+b)+`
-2. Alternaciones con prefijos comunes: `(cat|catch|ca)+`
-3. Grupos que se solapan entre si
+Midiendo suficientes peticiones con diferentes prefijos, un atacante puede reconstruir el secreto correcto byte a byte. Con 256 posibles valores por byte y un secreto de 32 bytes, son necesarios 256 * 32 = 8.192 intentos en lugar de 256^32 (fuerza bruta completa).
 
-Con un input como `aaaaaaaaaaaaaaaaaaaaX` (muchas `a` seguidas de una letra que fuerza el fallo), el motor explora 2^n combinaciones para n caracteres, bloqueando el thread o proceso durante segundos o minutos con un solo request.
+En la practica, el ataque requiere un gran numero de muestras para superar el ruido de red y del sistema. En entornos locales (microservicios) donde la latencia es muy baja y estable, el ataque es mas viable. Con hardware especializado y estadisticas avanzadas, se ha demostrado exitoso incluso en redes de area ancha.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/go/handlers/search.go`
+**Archivo:** `src/go/handlers/auth.go`
 
 ```go
 // CODIGO VULNERABLE — estado actual del ejercicio
-var emailPattern = regexp.MustCompile(`^(([a-zA-Z]+)+)@example\.com$`)
-
-func SearchHandler(w http.ResponseWriter, r *http.Request) {
-    input := r.URL.Query().Get("q")
-    if emailPattern.MatchString(input) {
-        w.Write([]byte("valid"))
+func ValidateAPIKey(w http.ResponseWriter, r *http.Request) {
+    provided := r.Header.Get("X-API-Key")
+    expected := getExpectedKey()
+    if provided == expected {  // comparacion que termina en el primer byte diferente
+        w.Write([]byte("authorized"))
+    } else {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
     }
 }
 ```
 
-El patron `(([a-zA-Z]+)+)` es vulnerable porque:
-- El grupo externo `(...)+` puede matchear una o mas veces
-- El grupo interno `[a-zA-Z]+` tambien puede matchear una o mas veces
-- Ambos grupos pueden repartirse los mismos caracteres de infinitas formas
+El operador `==` en Go (y en la mayoria de lenguajes) usa comparacion de igualdad eficiente: retorna `false` en cuanto encuentra el primer byte diferente. Esto significa:
+- Si `provided[0] != expected[0]`: retorna inmediatamente (tiempo minimo)
+- Si `provided[0..15] == expected[0..15]` pero `provided[16] != expected[16]`: tarda 16 comparaciones (tiempo mayor)
 
-Con input `aaaaaaaaaaaaaaaaaaaaX`, el motor intenta todas las formas de dividir las `a` entre los dos grupos antes de fallar en la `X`. El tiempo crece exponencialmente con la longitud del input.
-
-**Nota Go:** el paquete `regexp` de Go usa una implementacion NFA que evita el backtracking catastrofico. Sin embargo, el patron vulnerable aqui sirve como ejemplo del problema que es critico en otros lenguajes (Python `re`, JavaScript, Java, Ruby, PHP) y en dependencias de terceros.
+Esta diferencia de tiempo, aunque en nanosegundos, es estadisticamente detectable.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Input que provoca backtracking catastrofico (en motores con backtracking):**
-```
-GET /search?q=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX
-```
-
-En Python con el mismo patron:
+**Ataque de timing para descubrir la API key byte a byte:**
 ```python
-import re, time
-pattern = re.compile(r'^(([a-zA-Z]+)+)@example\.com$')
-start = time.time()
-pattern.match('a' * 30 + 'X')  # tarda >30 segundos con 30 caracteres
-print(time.time() - start)
+import requests, statistics, string, time
+
+def measure_time(prefix: str) -> float:
+    # Medir multiples veces para reducir ruido de red
+    times = []
+    for _ in range(100):
+        start = time.perf_counter_ns()
+        requests.get('https://api.empresa.com/protected',
+                    headers={'X-API-Key': prefix + 'A' * (32 - len(prefix))})
+        times.append(time.perf_counter_ns() - start)
+    return statistics.median(times)
+
+# Descubrir la key caracter por caracter
+discovered = ""
+for position in range(32):
+    best_char = ''
+    best_time = 0
+    for char in string.printable:
+        t = measure_time(discovered + char)
+        if t > best_time:
+            best_time = t
+            best_char = char
+    discovered += best_char
+    print(f"Byte {position}: {best_char} | Descubierto hasta ahora: {discovered}")
 ```
 
-**Numero de intentos necesario para DoS:**
-- 20 caracteres: ~1 segundo
-- 25 caracteres: ~30 segundos
-- 30 caracteres: >10 minutos
-- Con 3 peticiones concurrentes, el servidor queda inutilizable
-
-**Bibliotecas vulnerables frecuentes:**
-- `validator.js` (npm): tuvo multiples CVEs de ReDoS en validaciones de email/URL
-- `moment.js`: CVE-2022-24785 (ReDoS en parsing de fechas)
-- `express-fileupload`: CVE-2020-7699
+**Precondiciones para el exito:**
+- Conexion de baja latencia y jitter al servidor
+- Servidor sin rate limiting (o rate limiting permisivo)
+- Suficiente entropia estadistica (miles de muestras por byte)
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/go/handlers/search.go` para usar un patron sin backtracking catastrofico y limitar la longitud del input:
+Modifica `src/go/handlers/auth.go` para usar comparacion en tiempo constante:
 
 ```go
 // CODIGO SEGURO
 package handlers
 
 import (
+    "crypto/subtle"
     "net/http"
-    "regexp"
+    "os"
 )
 
-const maxInputLength = 254  // longitud maxima de email segun RFC 5321
-
-// Patron lineal: sin cuantificadores anidados, sin alternaciones con prefijo comun
-// [a-zA-Z0-9._%+\-]+ matchea una vez por caracter, sin posibilidad de repartir
-var safeEmailPattern = regexp.MustCompile(
-    `^[a-zA-Z0-9._%+\-]+@example\.com$`,
-)
-
-func SearchHandler(w http.ResponseWriter, r *http.Request) {
-    input := r.URL.Query().Get("q")
-
-    // Limitar longitud antes de evaluar la regex
-    if len(input) > maxInputLength {
-        http.Error(w, "Input too long", http.StatusBadRequest)
-        return
+func getExpectedKey() string {
+    key := os.Getenv("API_KEY")
+    if key == "" {
+        panic("API_KEY environment variable is required")
     }
+    return key
+}
 
-    if safeEmailPattern.MatchString(input) {
-        w.Write([]byte("valid"))
+func ValidateAPIKey(w http.ResponseWriter, r *http.Request) {
+    provided := r.Header.Get("X-API-Key")
+    expected := getExpectedKey()
+
+    // ConstantTimeCompare siempre recorre todos los bytes, nunca cortocircuita
+    // Ademas verifica longitud de forma que no filtra informacion
+    if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1 {
+        w.Write([]byte("authorized"))
     } else {
-        w.Write([]byte("invalid"))
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
     }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **Patron lineal `[a-zA-Z0-9._%+\-]+`:** cada posicion del input solo puede ser matcheada de una forma. No hay forma de "repartir" los caracteres entre grupos anidados. El motor evalua cada caracter exactamente una vez: complejidad O(n).
-- **Limite de longitud:** incluso con un patron potencialmente lento, limitar el input a 254 caracteres pone un techo al tiempo de evaluacion. Es la primera linea de defensa ante cualquier patron desconocido.
-- **Sin cuantificadores anidados:** la regla es: nunca `(X+)+`, nunca `(X|Y)+` donde X e Y comparten prefijos, nunca grupos que se solapan.
+- **`subtle.ConstantTimeCompare`:** implementada usando operaciones XOR que siempre recorren todos los bytes de ambos strings. El tiempo de ejecucion depende solo de la longitud de los strings, nunca de cuantos bytes coincidan. No hay "cortocircuito" temprano.
+- **Longitud constante:** `ConstantTimeCompare` devuelve `0` si las longitudes son distintas, sin comparar bytes. Esto tambien evita filtrar informacion de longitud aunque el tiempo sea diferente para strings de diferente longitud.
+- **Secreto desde entorno:** carga `API_KEY` desde variable de entorno, nunca hardcodeada en el codigo. Falla con `panic` al arranque si falta, lo que es correcto: mejor fallar en startup que operar sin autenticacion.
 
 ---
 
-## Variantes de la misma categoria (DoS via logica vulnerable — mas complejas)
+## Variantes de la misma categoria (Cryptographic Failures via Timing — mas complejas)
 
-### Variante A: ReDoS en validacion de URL (JavaScript/Node.js)
+### Variante A: Timing Attack en verificacion de HMAC
 
-```javascript
-// VULNERABLE — patron con backtracking catastrofico en validacion de URL
-const URL_PATTERN = /^(https?:\/\/)?(([a-zA-Z\d]([a-zA-Z\d-]*[a-zA-Z\d])*)\.)+[a-zA-Z]{2,}$/;
+```python
+# VULNERABLE — comparacion directa de HMAC permite timing attack
+import hmac, hashlib
 
-app.get('/validate', (req, res) => {
-    const url = req.query.url;
-    // Con input como 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
-    // el motor tarda exponencialmente
-    res.json({ valid: URL_PATTERN.test(url) });
-});
+def verify_webhook(payload: bytes, signature: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return signature == expected  # termina en el primer byte diferente
 ```
 
-```javascript
-// SEGURO — usar la clase URL nativa del runtime (sin backtracking)
-app.get('/validate', (req, res) => {
-    const rawUrl = req.query.url;
-    if (rawUrl.length > 2048) {
-        return res.status(400).json({ error: 'URL too long' });
+```python
+# SEGURO — usar hmac.compare_digest (tiempo constante)
+import hmac, hashlib
+
+def verify_webhook(payload: bytes, signature: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)  # tiempo constante
+```
+
+`hmac.compare_digest` en Python es el equivalente de `subtle.ConstantTimeCompare` en Go. Usa XOR interno sobre todos los bytes.
+
+---
+
+### Variante B: Username Enumeration via diferencia de tiempo
+
+```java
+// VULNERABLE — fallar rapido si el usuario no existe, lento si la contrasena es incorrecta
+@PostMapping("/login")
+public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
+    User user = userRepository.findByUsername(username);  // consulta a DB
+    if (user == null) {
+        return ResponseEntity.status(401).build();  // respuesta rapida: usuario no existe
     }
+    // bcrypt.verify tarda ~100ms: respuesta lenta si contrasena incorrecta
+    if (!bcrypt.verify(password, user.getPasswordHash())) {
+        return ResponseEntity.status(401).build();
+    }
+    return ResponseEntity.ok(generateToken(user));
+}
+```
+
+El atacante puede distinguir "usuario no existe" (respuesta rapida) de "usuario existe pero contrasena incorrecta" (respuesta lenta) por diferencia de tiempo, enumerando usuarios validos.
+
+```java
+// SEGURO — tiempo constante independientemente de si el usuario existe
+@PostMapping("/login")
+public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
+    User user = userRepository.findByUsername(username);
+    String hashToVerify = (user != null)
+        ? user.getPasswordHash()
+        : "$2a$10$dummy_hash_to_waste_same_time_as_real_verification";
+    // Siempre ejecutar bcrypt.verify para mantener tiempo constante
+    boolean valid = bcrypt.verify(password, hashToVerify) && user != null;
+    if (!valid) {
+        return ResponseEntity.status(401).build();
+    }
+    return ResponseEntity.ok(generateToken(user));
+}
+```
+
+---
+
+### Variante C: Padding Oracle Attack (CBC decryption oracle)
+
+Un padding oracle es una forma avanzada de timing/error attack donde el servidor revela si el padding de un bloque AES-CBC es valido:
+
+```java
+// VULNERABLE — el servidor devuelve errores diferentes para padding invalido vs. MAC invalido
+@PostMapping("/decrypt")
+public ResponseEntity<?> decrypt(@RequestBody String ciphertext) {
     try {
-        const parsed = new URL(rawUrl);  // parser nativo, no regex
-        const valid = ['http:', 'https:'].includes(parsed.protocol);
-        res.json({ valid });
-    } catch {
-        res.json({ valid: false });
+        byte[] decrypted = aesCbcDecrypt(ciphertext);
+        return ResponseEntity.ok(decrypted);  // OK: padding y MAC validos
+    } catch (BadPaddingException e) {
+        return ResponseEntity.status(400).body("Invalid padding");  // filtra info de padding
+    } catch (InvalidMACException e) {
+        return ResponseEntity.status(400).body("Invalid MAC");  // respuesta diferente
     }
-});
+}
 ```
 
----
+Con esta diferencia de errores, un atacante puede descifrar cualquier ciphertext byte a byte sin conocer la clave (ataque de Vaudenay, 2002).
 
-### Variante B: Catastrophic Backtracking en validacion de fechas (Python)
-
-```python
-# VULNERABLE — validacion de fecha con alternacion que causa backtracking
-DATE_PATTERN = re.compile(
-    r'^(\d{4})[-/.](\d{1,2}|0[1-9]|1[0-2])[-/.](\d{1,2}|0[1-9]|[12]\d|3[01])$'
-)
-```
-
-Este patron tiene alternaciones `(\d{1,2}|0[1-9]|1[0-2])` con prefijos comunes (todos pueden empezar por un digito). Con input `1999-99-99999999999X`, el backtracking es cuadratico.
-
-```python
-# SEGURO — patron sin alternaciones solapadas + longitud fija
-DATE_PATTERN = re.compile(r'^\d{4}[-/.]\d{2}[-/.]\d{2}$')
-
-def validate_date(date_str: str) -> bool:
-    if len(date_str) > 10:
-        return False
-    if not DATE_PATTERN.match(date_str):
-        return False
-    # Validacion logica post-regex (mes 1-12, dia 1-31)
-    parts = re.split(r'[-/.]', date_str)
-    month, day = int(parts[1]), int(parts[2])
-    return 1 <= month <= 12 and 1 <= day <= 31
-```
-
----
-
-### Variante C: Amplification via compresion (zip bomb) — DoS de otro tipo
-
-```python
-# VULNERABLE — descomprimir sin limitar el taman~o del output
-import zipfile
-
-@router.post("/extract")
-async def extract(file: UploadFile):
-    with zipfile.ZipFile(file.file) as z:
-        total = sum(info.file_size for info in z.infolist())
-        z.extractall("/tmp/output")  # puede descomprimir GBs desde pocos KB
-```
-
-Un zip bomb como `42.zip` (42 KB) se expande a 4.5 PB de datos anidados.
-
-```python
-# SEGURO — limitar taman~o total antes de extraer
-MAX_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MB
-
-@router.post("/extract")
-async def extract(file: UploadFile):
-    with zipfile.ZipFile(file.file) as z:
-        total = sum(info.file_size for info in z.infolist())
-        if total > MAX_UNCOMPRESSED:
-            raise HTTPException(status_code=400, detail="Archivo demasiado grande")
-        z.extractall("/tmp/output")
+```java
+// SEGURO — usar AEAD (AES-GCM) en lugar de AES-CBC + HMAC separado
+// AES-GCM verifica integridad y descifra en una sola operacion atomica
+// Si el tag de autenticacion falla, no hay ninguna informacion de padding
+@PostMapping("/decrypt")
+public ResponseEntity<?> decrypt(@RequestBody String ciphertext) {
+    try {
+        byte[] decrypted = aesGcmDecrypt(ciphertext);  // AEAD: un solo error generico
+        return ResponseEntity.ok(decrypted);
+    } catch (AEADBadTagException e) {
+        return ResponseEntity.status(400).body("Decryption failed");  // error generico
+    }
+}
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP CWE-1333: ReDoS](https://cwe.mitre.org/data/definitions/1333.html)
-- [PortSwigger - ReDoS](https://portswigger.net/web-security/essential-skills/obfuscating-attacks-using-encodings)
-- [OWASP ReDoS article](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
-- [CVE-2022-24785 — ReDoS en moment.js](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-24785)
+- [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
+- [CWE-208: Observable Timing Discrepancy](https://cwe.mitre.org/data/definitions/208.html)
+- [Go crypto/subtle documentation](https://pkg.go.dev/crypto/subtle)
+- [Padding Oracle Attack - Vaudenay 2002](https://www.iacr.org/archive/eurocrypt2002/23320530/cbc02_e02d.pdf)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 13** exige que `src/go/handlers/search.go` contenga:
-- `safeEmailPattern`
-- El limite de longitud del input
-- La desaparicion del patron vulnerable
+El workflow **Validate Step 14** exige que `src/go/handlers/auth.go` contenga:
+- `subtle.ConstantTimeCompare`
+- `os.Getenv("API_KEY")`
+- La ausencia de `provided == expected`
