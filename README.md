@@ -1,205 +1,249 @@
-# Paso 11 — HTTP Header Injection
-**Tecnologia:** Go | **OWASP:** A03:2021 - Injection | **CWE-113**
+# Paso 12 — Race Condition / TOCTOU
+**Tecnologia:** Go | **OWASP:** A01:2021 - Broken Access Control | **CWE-367**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-HTTP Header Injection (tambien llamada Response Splitting) ocurre cuando una aplicacion escribe en un header HTTP un valor controlado por el usuario sin eliminar los caracteres de control `\r` (CR) y `\n` (LF). En el protocolo HTTP, la secuencia `\r\n` separa los headers de la respuesta. Inyectando esta secuencia, un atacante puede:
+Time-of-Check to Time-of-Use (TOCTOU) es una race condition donde una aplicacion verifica una condicion (check) y luego actua en base a ella (use), pero entre ambas operaciones otro proceso o goroutine puede modificar el estado del sistema, invalidando la verificacion.
 
-- Anadir headers arbitrarios a la respuesta (ej: `Set-Cookie` fraudulento)
-- Dividir la respuesta HTTP en dos y controlar el cuerpo de la segunda
-- Envenenar caches HTTP intermedias (cache poisoning)
-- Forzar descargas de archivos maliciosos con `Content-Disposition`
+El problema fundamental es que la combinacion de dos operaciones atomicas individuales no es, en si misma, atomica. Hay una ventana temporal entre el "check" y el "use" que puede ser aprovechada.
 
-El header mas vulnerable es `Location` en redirecciones, porque acepta URLs que pueden contener caracteres codificados que al decodificar incluyen `%0d%0a` (\r\n).
+En sistemas de archivos esto es critico: un archivo puede ser creado, movido o reemplazado por un enlace simbolico entre que se verifica su existencia y se crea. En sistemas de alta concurrencia (servidores web), incluso ventanas de microsegundos pueden ser explotadas con ataques de alta frecuencia.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/go/handlers/headers.go`
+**Archivo:** `src/go/handlers/upload.go`
 
 ```go
 // CODIGO VULNERABLE — estado actual del ejercicio
-func RedirectHandler(w http.ResponseWriter, r *http.Request) {
-    next := r.URL.Query().Get("next")  // input del usuario
-    w.Header().Set("Location", next)  // escribe next directamente en el header
-    w.WriteHeader(http.StatusFound)
+func UploadHandler(w http.ResponseWriter, r *http.Request) {
+    filename := r.FormValue("name")
+    path := filepath.Join(uploadDir, filename)
+
+    // CHECK: verificar si el archivo existe
+    if _, err := os.Stat(path); err == nil {
+        http.Error(w, "File already exists", http.StatusConflict)
+        return
+    }
+
+    // ------- VENTANA TOCTOU: otro goroutine puede crear el archivo aqui -------
+
+    // USE: crear el archivo (puede sobrescribir uno creado en la ventana)
+    f, _ := os.Create(path)
+    defer f.Close()
+    io.Copy(f, r.Body)
 }
 ```
 
-Al escribir `next` directamente en el header `Location`, si `next` contiene `\r\n`, el servidor emite dos headers donde deberia haber uno. El cliente HTTP o el navegador puede interpretar lo que viene despues de `\r\n` como un header adicional de la respuesta.
+La ventana TOCTOU esta entre `os.Stat()` y `os.Create()`. En un servidor web con goroutines concurrentes, dos peticiones simultaneas para el mismo filename pasaran ambas el check de `os.Stat` (el archivo no existe) y ambas llegaran a `os.Create`, donde la segunda sobrescribira el archivo creado por la primera.
+
+Ademas, `filename` no esta validado: un atacante puede enviar `../../../etc/cron.d/backdoor` como nombre de archivo.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Inyeccion de Set-Cookie fraudulento:**
+**Path Traversal via nombre de archivo:**
 ```
-GET /redirect?next=/home%0d%0aSet-Cookie:+session=attacker_session%3B+Path%3D%2F
-```
-
-La respuesta HTTP generada seria:
-```
-HTTP/1.1 302 Found
-Location: /home
-Set-Cookie: session=attacker_session; Path=/
+POST /upload
+name=../../../etc/cron.d/evil-job
+[cuerpo: script de cron malicioso]
 ```
 
-El navegador de la victima sobrescribe su cookie de sesion con la del atacante (session fixation).
+Sobrescribe un archivo de cron del sistema si el proceso tiene permisos suficientes.
 
-**Cache Poisoning via response splitting:**
-```
-GET /redirect?next=%0d%0aHTTP/1.1+200+OK%0d%0aContent-Type:+text/html%0d%0a%0d%0a<script>alert(1)</script>
+**TOCTOU para sobrescribir archivos existentes:**
+```bash
+# El atacante lanza dos peticiones concurrentes para el mismo archivo
+curl -X POST /upload -d "name=config.json" -d @config.json &
+curl -X POST /upload -d "name=config.json" -d @malicious.json &
+# Una de ellas pasara el check y sobrescribira el archivo legiti
 ```
 
-Un proxy intermedio puede cachear la segunda "respuesta" manufacturada y servir el XSS a usuarios posteriores.
-
-**Inyeccion de Content-Type para forzar descarga:**
-```
-GET /redirect?next=/file%0d%0aContent-Disposition:+attachment%3B+filename%3Dmalware.exe
+**Symlink attack:**
+```bash
+# Mientras la aplicacion ejecuta os.Stat() y antes de os.Create()
+# el atacante crea un symlink que apunta a un archivo sensible
+ln -s /etc/passwd /var/uploads/target.txt
+# La siguiente os.Create() seguira el symlink y sobrescribira /etc/passwd
 ```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/go/handlers/headers.go` para sanitizar el valor del header y usar allowlist de destinos:
+Modifica `src/go/handlers/upload.go` para usar una operacion atomica que elimina la ventana TOCTOU:
 
 ```go
 // CODIGO SEGURO
 package handlers
 
 import (
+    "io"
     "net/http"
-    "strings"
+    "os"
+    "path/filepath"
 )
 
-var allowedRedirects = map[string]bool{
-    "/home":      true,
-    "/dashboard": true,
-    "/profile":   true,
-}
+const uploadDir = "/var/uploads"
 
-// sanitizeHeaderValue elimina caracteres de control del valor de un header
-func sanitizeHeaderValue(value string) string {
-    value = strings.ReplaceAll(value, "\r", "")
-    value = strings.ReplaceAll(value, "\n", "")
-    return value
-}
-
-func RedirectHandler(w http.ResponseWriter, r *http.Request) {
-    next := r.URL.Query().Get("next")
-    sanitized := sanitizeHeaderValue(next)
-
-    // Allowlist: solo redirigir a rutas internas conocidas
-    if !allowedRedirects[sanitized] {
-        sanitized = "/home"
+func UploadHandler(w http.ResponseWriter, r *http.Request) {
+    // Usar solo el nombre base del archivo (elimina path traversal)
+    filename := filepath.Base(r.FormValue("name"))
+    if filename == "." || filename == "" {
+        http.Error(w, "Invalid filename", http.StatusBadRequest)
+        return
     }
+    path := filepath.Join(uploadDir, filename)
 
-    w.Header().Set("Location", sanitized)
-    w.WriteHeader(http.StatusFound)
+    // O_CREATE|O_EXCL es atomico: crea el archivo SOLO si no existe.
+    // Si ya existe, falla con error. No hay ventana entre check y create.
+    f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+    if err != nil {
+        if os.IsExist(err) {
+            http.Error(w, "File already exists", http.StatusConflict)
+        } else {
+            http.Error(w, "Internal error", http.StatusInternalServerError)
+        }
+        return
+    }
+    defer f.Close()
+    io.Copy(f, r.Body)
+    w.WriteHeader(http.StatusCreated)
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`sanitizeHeaderValue`:** elimina `\r` y `\n` del valor antes de escribirlo en el header. Sin estos caracteres, es imposible inyectar headers adicionales o dividir la respuesta.
-- **Allowlist de destinos:** aunque la sanitizacion sea suficiente para prevenir header injection, la allowlist garantiza ademas que no se puede hacer open redirect. Defense in depth.
-- **Destino seguro por defecto:** si `sanitized` no esta en la allowlist, la redireccion va a `/home`. El atacante no recibe error descriptivo.
+- **`O_CREATE|O_EXCL` atomico:** a nivel de kernel, `open(2)` con `O_CREAT|O_EXCL` es atomico. El kernel verifica y crea en una sola operacion indivisible. No hay ventana entre el check y el create. Si el archivo ya existe, `open()` falla con `EEXIST`.
+- **`filepath.Base()`:** extrae solo el nombre del archivo de la ruta proporcionada, descartando cualquier componente de directorio. `../../../etc/passwd` se convierte en `passwd`. Previene path traversal.
+- **Manejo explicito de errores:** distinguir `os.IsExist` de otros errores permite respuestas HTTP apropiadas sin exponer informacion interna.
 
 ---
 
-## Variantes de la misma categoria (Injection en headers y protocolos — mas complejas)
+## Variantes de la misma categoria (Race Conditions — mas complejas)
 
-### Variante A: HTTP Request Smuggling (CL.TE / TE.CL)
+### Variante A: Double-Spend Race Condition en transferencias
 
-HTTP Request Smuggling ocurre cuando un proxy frontend y el servidor backend interpretan de forma diferente donde termina una peticion HTTP, permitiendo al atacante "contrabandear" una peticion dentro de otra.
-
-```
-# ATAQUE CL.TE: frontend usa Content-Length, backend usa Transfer-Encoding
-POST / HTTP/1.1
-Host: empresa.com
-Content-Length: 13
-Transfer-Encoding: chunked
-
-0
-
-GET /admin HTTP/1.1
-Host: empresa.com
+```python
+# VULNERABLE — check de saldo y debito no son atomicos
+@router.post("/transfer")
+async def transfer(amount: int, to_account: str, user=Depends(get_current_user)):
+    balance = db.get_balance(user.id)    # CHECK: leer saldo
+    if balance < amount:
+        raise HTTPException(status_code=400, detail="Saldo insuficiente")
+    # VENTANA: otra peticion puede leer el mismo saldo aqui
+    db.debit(user.id, amount)            # USE: debitar
+    db.credit(to_account, amount)
 ```
 
-El frontend envia la peticion completa como un POST. El backend, usando Transfer-Encoding, procesa el `0\r\n\r\n` como fin del cuerpo, y trata `GET /admin HTTP/1.1` como el inicio de la siguiente peticion del atacante.
+Un atacante envia dos peticiones de transferencia de 100 EUR con saldo de 100 EUR simultaneamente. Ambas pasan el check de saldo, y ambas debitan 100 EUR, dejando la cuenta en -100 EUR.
 
-**Mitigacion:** normalizar todos los headers en el proxy, rechazar peticiones con ambos headers `Content-Length` y `Transfer-Encoding`, o usar HTTP/2 que no tiene este problema.
-
----
-
-### Variante B: Host Header Injection (Password Reset Poisoning)
-
-```go
-// VULNERABLE — usar el header Host para construir URLs en emails
-func PasswordResetHandler(w http.ResponseWriter, r *http.Request) {
-    host := r.Host  // controlado por el cliente
-    token := generateResetToken()
-    resetURL := fmt.Sprintf("https://%s/reset?token=%s", host, token)
-    sendResetEmail(email, resetURL)  // el link del email apunta al host del atacante
-}
-```
-
-El atacante modifica el header `Host: evil.com` en la peticion de reset. El email enviado a la victima contiene el link `https://evil.com/reset?token=TOKEN`. Cuando la victima hace clic, envia el token al servidor del atacante.
-
-```go
-// SEGURO — usar una URL base configurada, nunca el header Host
-var baseURL = os.Getenv("APP_BASE_URL")  // "https://app.empresa.com"
-
-func PasswordResetHandler(w http.ResponseWriter, r *http.Request) {
-    token := generateResetToken()
-    resetURL := fmt.Sprintf("%s/reset?token=%s", baseURL, token)
-    sendResetEmail(email, resetURL)
-}
+```python
+# SEGURO — transaccion con SELECT FOR UPDATE (bloqueo pesimista)
+@router.post("/transfer")
+async def transfer(amount: int, to_account: str, user=Depends(get_current_user)):
+    async with db.transaction():
+        # SELECT FOR UPDATE bloquea la fila hasta que la transaccion termine
+        balance = await db.execute(
+            "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE",
+            user.id
+        )
+        if balance < amount:
+            raise HTTPException(status_code=400)
+        await db.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, user.id)
+        await db.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", amount, to_account)
 ```
 
 ---
 
-### Variante C: Content-Type Sniffing via header injection
+### Variante B: TOCTOU en verificacion de autorizacion
 
 ```go
-// VULNERABLE — Content-Type del archivo derivado del input del usuario
-func DownloadHandler(w http.ResponseWriter, r *http.Request) {
-    mimeType := r.URL.Query().Get("type")  // controlado por el usuario
-    w.Header().Set("Content-Type", mimeType)  // inyeccion posible
-    w.Write(fileContent)
+// VULNERABLE — verificar permisos y luego actuar en operaciones separadas
+func DeleteHandler(w http.ResponseWriter, r *http.Request) {
+    fileID := r.URL.Query().Get("id")
+
+    // CHECK: verificar que el usuario es propietario
+    owner := db.GetFileOwner(fileID)
+    if owner != currentUser {
+        http.Error(w, "Forbidden", http.StatusForbidden)
+        return
+    }
+
+    // VENTANA: entre el check y el borrado, la propiedad puede cambiar
+    // (ej: el archivo es transferido a otro usuario)
+
+    // USE: borrar el archivo
+    db.DeleteFile(fileID)
 }
 ```
 
-El atacante puede inyectar `Content-Type: text/html\r\n` y convertir una descarga de archivo en una pagina HTML renderizable, posibilitando XSS.
-
 ```go
-// SEGURO — detectar MIME del contenido real, nunca del parametro
-func DownloadHandler(w http.ResponseWriter, r *http.Request) {
-    mimeType := http.DetectContentType(fileContent)  // basado en los bytes reales
-    w.Header().Set("Content-Type", mimeType)
-    w.Header().Set("X-Content-Type-Options", "nosniff")  // previene sniffing en IE
-    w.Write(fileContent)
+// SEGURO — verificacion y accion en una sola query atomica
+func DeleteHandler(w http.ResponseWriter, r *http.Request) {
+    fileID := r.URL.Query().Get("id")
+    // DELETE WHERE filtra por propiedad atomicamente
+    affected := db.Exec(
+        "DELETE FROM files WHERE id = $1 AND owner_id = $2",
+        fileID, currentUser,
+    )
+    if affected == 0 {
+        http.Error(w, "Not found or forbidden", http.StatusNotFound)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
 }
+```
+
+---
+
+### Variante C: Race Condition en generacion de nombres de archivo temporales
+
+```python
+# VULNERABLE — crear archivo temporal con nombre predecible
+import os, time
+
+def process_upload(content: bytes) -> str:
+    tmpfile = f"/tmp/upload_{int(time.time())}"  # nombre predecible
+    if os.path.exists(tmpfile):                  # TOCTOU check
+        raise Exception("Temp file exists")
+    with open(tmpfile, 'wb') as f:               # TOCTOU use
+        f.write(content)
+    return tmpfile
+```
+
+```python
+# SEGURO — usar tempfile del sistema que garantiza atomicidad y nombre unico
+import tempfile
+
+def process_upload(content: bytes) -> str:
+    # mkstemp crea el archivo atomicamente con nombre unico e impredecible
+    fd, tmpfile = tempfile.mkstemp(prefix="upload_", dir="/var/tmp")
+    try:
+        os.write(fd, content)
+    finally:
+        os.close(fd)
+    return tmpfile
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A03:2021 - Injection](https://owasp.org/Top10/A03_2021-Injection/)
-- [CWE-113: HTTP Response Splitting](https://cwe.mitre.org/data/definitions/113.html)
-- [PortSwigger - HTTP request smuggling](https://portswigger.net/web-security/request-smuggling)
-- [PortSwigger - Host header injection](https://portswigger.net/web-security/host-header)
+- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
+- [CWE-367: TOCTOU Race Condition](https://cwe.mitre.org/data/definitions/367.html)
+- [CWE-362: Concurrent Execution with Shared Resource (Race Condition)](https://cwe.mitre.org/data/definitions/362.html)
+- [Linux man page - open(2) con O_EXCL](https://man7.org/linux/man-pages/man2/open.2.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 11** exige que `src/go/handlers/headers.go` contenga:
-- `sanitizeHeaderValue`
-- `allowedRedirects`
-- El uso del valor saneado en `Location`
+El workflow **Validate Step 12** exige que `src/go/handlers/upload.go` contenga:
+- `filepath.Base`
+- `os.OpenFile` con `O_CREATE|O_EXCL|O_WRONLY`
+- La ausencia de `os.Create(path)`
