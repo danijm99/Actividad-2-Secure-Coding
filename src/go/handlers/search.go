@@ -23,11 +23,19 @@ import (
 // exponencial de combinaciones, bloqueando el servidor durante segundos o minutos.
 // Esto es suficiente para un ataque de denegacion de servicio con pocas peticiones.
 
-var emailPattern = regexp.MustCompile(`^(([a-zA-Z]+)+)@example\.com$`)
+const maxInputLength = 254
+var safeEmailPattern = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@example\.com$`)
 
 func SearchHandler(w http.ResponseWriter, r *http.Request) {
 	input := r.URL.Query().Get("q")
-	if emailPattern.MatchString(input) {
+	if len(input) > maxInputLength {
+		http.Error(w, "Input too long", http.StatusBadRequest)
+		return
+	}
+
+	if safeEmailPattern.MatchString(input) {
 		w.Write([]byte("valid"))
+	} else {
+		w.Write([]byte("invalid"))
 	}
 }
