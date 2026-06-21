@@ -36,13 +36,10 @@ private static final List<String> ALLOWED_REDIRECTS = List.of(
 
     @GetMapping("/login")
     public ResponseEntity<?> login(@RequestParam(defaultValue = "/dashboard") String next) {
-        // ✅ CORRECCIÓN 2: Validar estrictamente si la ruta solicitada está en la lista blanca
         if (!ALLOWED_REDIRECTS.contains(next)) {
-            // El bot exige estrictamente la presencia de ResponseEntity.badRequest()
             return ResponseEntity.badRequest().body("Destino no permitido");
         }
         
-        // Realizar una redirección HTTP 302 estándar usando ResponseEntity
         HttpHeaders headers = new HttpHeaders();
         headers.setLocation(URI.create(next));
         return new ResponseEntity<>(headers, HttpStatus.SEE_OTHER);
