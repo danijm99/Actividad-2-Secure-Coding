@@ -28,7 +28,7 @@ var safeEmailPattern = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@example\.com$`)
 
 func SearchHandler(w http.ResponseWriter, r *http.Request) {
 	input := r.URL.Query().Get("q")
-	if len(input) > maxInputLength {
+	if len(input) > 200 {
 		http.Error(w, "Input too long", http.StatusBadRequest)
 		return
 	}
