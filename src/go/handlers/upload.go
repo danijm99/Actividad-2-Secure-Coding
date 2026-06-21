@@ -31,13 +31,25 @@ const uploadDir = "/var/uploads"
 // de carrera que corrompan datos.
 
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
-	filename := r.FormValue("name")
-	path := filepath.Join(uploadDir, filename)
-	if _, err := os.Stat(path); err == nil {
-		http.Error(w, "File already exists", http.StatusConflict)
+	// ✅ CORRECCIÓN 1: Extraer solo el nombre base para mitigar Path Traversal por completo
+	filename := filepath.Base(r.FormValue("name"))
+	if filename == "." || filename == "" {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
-	f, _ := os.Create(path)
+	path := filepath.Join(uploadDir, filename)
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		if os.IsExist(err) {
+			http.Error(w, "File already exists", http.StatusConflict)
+		} else {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+		}
+		return
+	}
 	defer f.Close()
+
 	io.Copy(f, r.Body)
+	w.WriteHeader(http.StatusCreated)
 }
