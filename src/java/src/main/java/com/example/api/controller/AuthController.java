@@ -31,11 +31,23 @@ public class AuthController {
     // Esto inyecta una linea falsa en los logs que puede confundir a analistas
     // o sistemas SIEM, ocultando actividad maliciosa real.
 
+private static String sanitizeForLog(String input) {
+        if (input == null) return "null";
+        
+        // Reemplazar saltos de línea (\r, \n) y tabuladores (\t) por un guion bajo
+        String sanitized = input.replaceAll("[\\r\\n\\t]", "_");
+        
+        // ✅ CORRECCIÓN 2: Limitar la longitud del texto para evitar saturación de almacenamiento (DoS)
+        if (sanitized.length() > 100) {
+            sanitized = sanitized.substring(0, 100) + "[truncado]";
+        }
+        return sanitized;
+    }
+
     @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestParam String username,
-                                   @RequestParam String password) {
-        log.info("Login attempt for user: " + username);
-        // autenticar usuario...
+    public ResponseEntity<?> login(@RequestParam String username, @RequestParam String password) {
+        log.info("Login attempt for user: {}", sanitizeForLog(username));
+        
         return ResponseEntity.ok(Map.of("message", "OK"));
     }
 }
