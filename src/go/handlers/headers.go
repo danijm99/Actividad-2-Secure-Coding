@@ -25,8 +25,11 @@ var allowedRedirects = map[string]bool{
 }
 
 func sanitizeHeaderValue(value string) string {
-	value = strings.ReplaceAll(value, "\r", "")
-	value = strings.ReplaceAll(value, "\n", "")
+
+	if strings.ContainsAny(value, "\r\n") {
+		value = strings.ReplaceAll(value, "\r", "")
+		value = strings.ReplaceAll(value, "\n", "")
+	}
 	return value
 }
 
@@ -41,3 +44,4 @@ func RedirectHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Location", safe)
 	w.WriteHeader(http.StatusFound)
+}
