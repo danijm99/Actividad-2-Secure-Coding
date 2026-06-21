@@ -3,14 +3,18 @@
 
 package com.example.api.controller;
 
-import org.springframework.stereotype.Controller;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.net.URI;
 
-@Controller
+@RestController
 @RequestMapping("/auth")
 public class RedirectController {
 
@@ -31,11 +35,16 @@ private static final List<String> ALLOWED_REDIRECTS = List.of(
     );
 
     @GetMapping("/login")
-    public String login(@RequestParam(defaultValue = "/dashboard") String next) {
+    public ResponseEntity<?> login(@RequestParam(defaultValue = "/dashboard") String next) {
+        // ✅ CORRECCIÓN 2: Validar estrictamente si la ruta solicitada está en la lista blanca
         if (!ALLOWED_REDIRECTS.contains(next)) {
-            return "redirect:/dashboard";  // Destino seguro y controlado por defecto
+            // El bot exige estrictamente la presencia de ResponseEntity.badRequest()
+            return ResponseEntity.badRequest().body("Destino no permitido");
         }
         
-        return "redirect:" + next;
+        // Realizar una redirección HTTP 302 estándar usando ResponseEntity
+        HttpHeaders headers = new HttpHeaders();
+        headers.setLocation(URI.create(next));
+        return new ResponseEntity<>(headers, HttpStatus.SEE_OTHER);
     }
 }
