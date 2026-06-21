@@ -1,212 +1,192 @@
-# Paso 7 — Open Redirect
-**Tecnologia:** Java / Spring Boot | **OWASP:** A01:2021 - Broken Access Control | **CWE-601**
+# Paso 8 — Insecure Randomness
+**Tecnologia:** Java / Spring Boot | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-338**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Open Redirect ocurre cuando una aplicacion redirige al usuario a una URL controlada por el atacante, usando como destino un parametro de la peticion sin validarlo. La pagina origen (tu dominio de confianza) actua como relay hacia un sitio malicioso.
+Insecure Randomness ocurre cuando una aplicacion usa un generador de numeros pseudoaleatorios (PRNG) debil para producir valores de seguridad como tokens de reset de contrasena, codigos de verificacion, session IDs o claves temporales. Los PRNGs como `java.util.Random` son deterministicos: dado el estado inicial (seed), toda la secuencia de valores futuros es predecible.
 
-Esto es especialmente peligroso en flujos de login: el patron `GET /login?next=<url>` es legitimo para redirigir al usuario a la pagina que intentaba visitar despues de autenticarse. Si no se valida `next`, un atacante puede construir un enlace aparentemente legitimo de `empresa.com` que lleva a `phishing.com`.
+`java.util.Random` usa un algoritmo lineal congruencial (LCG) cuyo estado interno tiene 48 bits. Con solo 2-3 tokens observados, un atacante puede calcular el estado interno del generador y predecir todos los tokens futuros. En un sistema con miles de usuarios, la probabilidad de predecir un token valido es muy alta.
 
-El atacante combina Open Redirect con ingenieria social: el usuario ve `empresa.com` en la URL del email de phishing, hace clic confiando en el dominio conocido, se autentica, y es redirigido al sitio del atacante que puede robar credenciales o tokens.
+La consecuencia directa es la toma de cuenta (account takeover): el atacante puede solicitar reset de contrasena para cualquier usuario y, conociendo el algoritmo, calcular el token que el servidor enviara por email antes de que la victima lo reciba.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/java/src/main/java/com/example/api/controller/RedirectController.java`
+**Archivo:** `src/java/src/main/java/com/example/api/controller/TokenController.java`
 
 ```java
 // CODIGO VULNERABLE — estado actual del ejercicio
-@GetMapping("/login")
-public String login(@RequestParam(defaultValue = "/dashboard") String next) {
-    return "redirect:" + next;  // next controlado por el usuario, sin validacion
+private final Random random = new Random();  // PRNG predecible
+
+@PostMapping("/reset-password")
+public ResponseEntity<?> requestReset(@RequestParam String email) {
+    String token = String.valueOf(random.nextInt(999999));  // max 6 digitos: 10^6 posibilidades
+    saveResetToken(email, token);
+    return ResponseEntity.ok(Map.of("message", "Reset email sent"));
 }
 ```
 
-El valor de `next` se usa directamente como destino de la redireccion. Spring MVC interpreta el prefijo `redirect:` y emite una respuesta `302 Found` con `Location: <valor_de_next>`. No importa que `next` sea un dominio externo: el servidor lo acepta sin restriccion.
+Dos problemas independientes:
+1. `Random` es predecible por algoritmo una vez que se conoce el seed.
+2. `nextInt(999999)` produce tokens de hasta 6 digitos decimales: solo 1 millon de valores posibles, atacables por fuerza bruta en minutos si el servidor no tiene rate limiting.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Phishing via login redirect:**
-```
-GET /auth/login?next=https://evil.com/fake-login HTTP/1.1
-Host: empresa.com
+**Prediccion de tokens via estado interno del PRNG:**
+```python
+# El atacante solicita resets para cuentas propias y observa 3 tokens
+tokens_observed = [482913, 731204, 298847]
+
+# Herramientas como "java-random-cracker" invierten el LCG en segundos
+# y recuperan el estado interno de 48 bits
+seed = crack_random_seed(tokens_observed)
+
+# Con el seed, predecir el siguiente token para la cuenta victima
+r = JavaRandom(seed)
+predicted_token = r.next_int(999999)
+print(f"Token predicho: {predicted_token}")
 ```
 
-El servidor responde:
-```
-HTTP/1.1 302 Found
-Location: https://evil.com/fake-login
-```
+**Fuerza bruta de 6 digitos:**
+Con solo 1.000.000 de valores posibles y sin rate limiting, un atacante puede probar todos en minutos.
 
-El atacante envia a la victima el enlace `https://empresa.com/auth/login?next=https://evil.com/fake-login` por email. La victima ve el dominio `empresa.com` y confia. Despues del login es redirigida a la pagina falsa del atacante.
-
-**Robo de token OAuth via redirect malicioso:**
-```
-GET /auth/login?next=https://evil.com
-```
-
-Si el token JWT o el codigo OAuth se pasa como fragmento o query param al destino, el atacante lo recibe directamente.
-
-**Bypass via URL encoding:**
-```
-GET /auth/login?next=https%3A%2F%2Fevil.com
-GET /auth/login?next=%2F%2Fevil.com   (protocol-relative URL)
-```
+**Timing attack en el reset:**
+Si el servidor procesa el reset sin expirar el token rapidamente, el atacante tiene una ventana de tiempo amplia para la prediccion o fuerza bruta.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `RedirectController.java` para validar el destino contra una lista de rutas permitidas:
+Modifica `TokenController.java` para usar `SecureRandom` con entropia suficiente:
 
 ```java
 // CODIGO SEGURO
-@Controller
-@RequestMapping("/auth")
-public class RedirectController {
+import java.security.SecureRandom;
+import java.util.Base64;
 
-    private static final List<String> ALLOWED_REDIRECTS = List.of(
-        "/dashboard",
-        "/profile",
-        "/settings",
-        "/orders"
-    );
+private final SecureRandom secureRandom = new SecureRandom();
 
-    @GetMapping("/login")
-    public String login(@RequestParam(defaultValue = "/dashboard") String next) {
-        // Solo redirigir a rutas internas de la allowlist
-        if (!ALLOWED_REDIRECTS.contains(next)) {
-            return "redirect:/dashboard";  // destino seguro por defecto
-        }
-        return "redirect:" + next;
-    }
+@PostMapping("/reset-password")
+public ResponseEntity<?> requestReset(@RequestParam String email) {
+    byte[] tokenBytes = new byte[32];  // 256 bits de entropia
+    secureRandom.nextBytes(tokenBytes);
+    String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+    // token tiene ~43 caracteres URL-safe, imposible de predecir o forzar bruta
+    saveResetToken(email, token);
+    return ResponseEntity.ok(Map.of("message", "Reset email sent"));
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **Allowlist de rutas internas:** solo se permiten rutas relativas predefinidas. Un atacante no puede incluir `https://evil.com` porque no esta en la lista.
-- **Solo rutas relativas (sin `://`):** incluso si la allowlist no se aplica correctamente, una URL relativa como `/dashboard` siempre apunta al mismo dominio servidor. No puede ser un dominio externo.
-- **Destino seguro por defecto:** si `next` no esta en la allowlist, en lugar de mostrar un error se redirige al dashboard. Esto evita exponer el mecanismo de validacion al atacante.
+- **`SecureRandom`:** usa fuentes de entropia del sistema operativo (`/dev/urandom` en Linux, `CryptGenRandom` en Windows). No es deterministico: no hay seed conocido ni algoritmo que permita predecir valores futuros a partir de valores observados.
+- **32 bytes (256 bits) de entropia:** con 2^256 posibilidades, la fuerza bruta es computacionalmente infeasible incluso con hardware especializado.
+- **Base64 URL-safe:** codifica los 32 bytes en caracteres seguros para URLs y emails, produciendo tokens de 43 caracteres. La codificacion no reduce la entropia.
 
 ---
 
-## Variantes de la misma categoria (Broken Access Control / Redirect — mas complejas)
+## Variantes de la misma categoria (Cryptographic Failures — mas complejas)
 
-### Variante A: Open Redirect via URL Fragment
+### Variante A: IV predecible en AES-CBC
 
-Algunas implementaciones solo validan el path y olvidan el fragment:
+Cifrar con AES-CBC usando un IV predecible o reutilizado expone el plaintext:
+
+```java
+// VULNERABLE — IV derivado de timestamp predecible
+public byte[] encrypt(byte[] data, byte[] key) throws Exception {
+    long timestamp = System.currentTimeMillis();  // predecible
+    byte[] iv = ByteBuffer.allocate(16).putLong(timestamp).array();  // IV predecible
+    Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+    cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
+    return cipher.doFinal(data);
+}
+```
+
+Si el IV es predecible, un atacante que conoce el plaintext de un mensaje cifrado puede montar un ataque de "chosen-plaintext" y deducir el contenido de otros mensajes.
+
+```java
+// SEGURO — IV aleatorio criptograficamente fuerte, enviado junto al ciphertext
+public byte[] encrypt(byte[] data, byte[] key) throws Exception {
+    byte[] iv = new byte[16];
+    new SecureRandom().nextBytes(iv);  // IV aleatorio e impredecible
+    Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+    cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
+    byte[] ciphertext = cipher.doFinal(data);
+    // Concatenar IV + ciphertext para que el receptor pueda descifrar
+    ByteBuffer result = ByteBuffer.allocate(iv.length + ciphertext.length);
+    result.put(iv).put(ciphertext);
+    return result.array();
+}
+```
+
+---
+
+### Variante B: Session ID basado en timestamp
 
 ```python
-# VULNERABLE — validacion incompleta que ignora el fragment
-def is_safe_redirect(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.netloc == '' or parsed.netloc == 'empresa.com'
-    # No valida: https://empresa.com@evil.com o http://evil.com#empresa.com
+# VULNERABLE — session ID derivado de tiempo y datos predecibles
+import time, hashlib
+
+def generate_session_id(user_id: int) -> str:
+    seed = f"{user_id}{time.time()}{user_id * 31}"
+    return hashlib.md5(seed.encode()).hexdigest()  # predecible si se conoce user_id y tiempo
 ```
 
-Bypass via credenciales en URL: `https://empresa.com@evil.com` — el navegador envia la peticion a `evil.com` con `empresa.com` como credencial de usuario.
-
-Bypass via fragment: la URL `https://empresa.com/login?next=//evil.com%23` puede hacer que la validacion vea `empresa.com` como host pero el navegador resuelva `evil.com` como destino real.
+Un atacante que conoce el `user_id` y el tiempo aproximado de login puede generar el mismo session ID.
 
 ```python
-# SEGURO — allowlist explicita y rechazo de URLs con netloc externo
-ALLOWED_PATHS = {"/dashboard", "/profile", "/settings"}
+# SEGURO — session ID con entropia del SO
+import secrets
 
-def is_safe_redirect(url: str) -> bool:
-    parsed = urlparse(url)
-    # Rechazar cualquier URL con dominio externo
-    if parsed.netloc and parsed.netloc != 'empresa.com':
-        return False
-    # Solo permitir rutas de la allowlist
-    return parsed.path in ALLOWED_PATHS
+def generate_session_id() -> str:
+    return secrets.token_urlsafe(32)  # 32 bytes = 256 bits de entropia del SO
 ```
 
 ---
 
-### Variante B: Subdomain Takeover + Open Redirect
+### Variante C: OTP (One-Time Password) predecible basado en tiempo sin TOTP
 
-```java
-// VULNERABLE — valida solo el dominio base pero acepta subdominios arbitrarios
-private boolean isSafeUrl(String url) {
-    return url.endsWith(".empresa.com") || url.equals("empresa.com");
-}
+```python
+# VULNERABLE — OTP basado en Random con seed de tiempo
+import random, time
+
+def generate_otp(user_id: int) -> str:
+    random.seed(int(time.time()))  # seed predecible
+    return str(random.randint(100000, 999999))
 ```
 
-Si el atacante registra un subdominio abandonado como `old-blog.empresa.com` (subdomain takeover), la URL `https://old-blog.empresa.com/phishing` pasaria la validacion.
+Dos usuarios que solicitan OTP en el mismo segundo reciben el mismo codigo. El codigo es predecible conociendo el tiempo aproximado.
 
-```java
-// SEGURO — set de dominios completos permitidos
-private static final Set<String> ALLOWED_HOSTS = Set.of(
-    "empresa.com",
-    "app.empresa.com",
-    "admin.empresa.com"
-);
+```python
+# SEGURO — usar TOTP estandar (RFC 6238) o secrets del SO
+import pyotp  # implementacion TOTP estandar
 
-private boolean isSafeUrl(String url) {
-    try {
-        URI uri = new URI(url);
-        return ALLOWED_HOSTS.contains(uri.getHost());
-    } catch (URISyntaxException e) {
-        return false;
-    }
-}
-```
+def generate_totp_secret() -> str:
+    return pyotp.random_base32()  # secreto con entropia del SO
 
----
-
-### Variante C: Redireccion en flujo OAuth (OAuth redirect_uri manipulation)
-
-```java
-// VULNERABLE — redirect_uri en OAuth sin validacion estricta
-@GetMapping("/oauth/authorize")
-public ResponseEntity<?> authorize(
-        @RequestParam String client_id,
-        @RequestParam String redirect_uri,
-        @RequestParam String state) {
-    // Solo valida que empiece con el dominio registrado
-    if (!redirect_uri.startsWith("https://app.cliente.com")) {
-        return ResponseEntity.badRequest().build();
-    }
-    // Procede con la autorizacion
-    String code = generateAuthCode(client_id, state);
-    return ResponseEntity.status(302).header("Location", redirect_uri + "?code=" + code).build();
-}
-```
-
-Bypass: `redirect_uri=https://app.cliente.com.evil.com/callback` empieza por el dominio correcto pero el host real es `app.cliente.com.evil.com`.
-
-```java
-// SEGURO — comparacion exacta de redirect_uri contra los registrados en DB
-@GetMapping("/oauth/authorize")
-public ResponseEntity<?> authorize(...) {
-    OAuthClient client = clientRepository.findById(client_id);
-    // Comparacion exacta: la redirect_uri debe ser exactamente la registrada
-    if (!client.getRegisteredRedirectUris().contains(redirect_uri)) {
-        return ResponseEntity.badRequest().build();
-    }
-    // ...
-}
+def get_current_otp(secret: str) -> str:
+    return pyotp.TOTP(secret).now()  # TOTP: derivado de HMAC-SHA1 sobre tiempo Unix
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
-- [CWE-601: Open Redirect](https://cwe.mitre.org/data/definitions/601.html)
-- [OWASP Open Redirect Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html)
-- [PortSwigger - Open redirection](https://portswigger.net/web-security/host-header/exploiting/password-reset-poisoning)
+- [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
+- [CWE-338: Use of Cryptographically Weak PRNG](https://cwe.mitre.org/data/definitions/338.html)
+- [Java Security - SecureRandom](https://docs.oracle.com/javase/8/docs/api/java/security/SecureRandom.html)
+- [NIST SP 800-90A - Random Number Generation](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-90Ar1.pdf)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 07** exige que `RedirectController.java` contenga:
-- `ALLOWED_REDIRECTS`
-- La comprobacion `contains(next)`
+El workflow **Validate Step 08** exige que `TokenController.java` contenga:
+- `SecureRandom`
+- `nextBytes`
+- La ausencia de `new Random()`
