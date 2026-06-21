@@ -1,0 +1,40 @@
+name: Start Tutorial
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar si el tutorial ya esta iniciado
+        id: check
+        run: |
+          if [ -f .tutorial-started ]; then
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "started=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start tutorial from step 01
+        if: steps.check.outputs.started == 'false'
+        run: bash scripts/tutorial.sh start
+
+      - name: Commit tutorial start
+        if: steps.check.outputs.started == 'false'
+        run: |
+          if git diff --quiet -- README.md .tutorial/state.env .tutorial-started; then
+            echo "No hay cambios que confirmar"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md .tutorial/state.env .tutorial-started
+          git commit -m "progress: tutorial iniciado [skip ci]"
+          git push
