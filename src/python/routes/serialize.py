@@ -3,7 +3,7 @@
 
 import json
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 router = APIRouter()
 
@@ -25,6 +25,12 @@ class UserPreferences(BaseModel):
     theme: str
     language: str
     notifications: bool
+    @field_validator('theme')
+    @classmethod
+    def validate_theme(cls, v: str) -> str:
+        if not v:
+            raise ValueError('El tema no puede estar vacío')
+        return v
 
 @router.post("/load-prefs")
 async def load_prefs(data: str):
