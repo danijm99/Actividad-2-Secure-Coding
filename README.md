@@ -1,246 +1,218 @@
-# Paso 29 — Mass Assignment
-**Tecnologia:** TypeScript / NestJS | **OWASP:** A01:2021 - Broken Access Control | **CWE-915**
+# Paso 30 — LDAP Injection
+**Tecnologia:** TypeScript / NestJS | **OWASP:** A03:2021 - Injection | **CWE-90**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Mass Assignment ocurre cuando una aplicacion web vincula automaticamente los campos de un objeto del request HTTP a los campos de un modelo o entidad de base de datos, sin filtrar que campos el usuario tiene permiso de modificar. El atacante puede enviar campos extra en el JSON del request (como `isAdmin: true`, `role: "admin"`, `balance: 999999`) que el servidor acepta y aplica porque "mergeea" todo el body en el objeto.
+LDAP Injection ocurre cuando input del usuario se incorpora sin escapar a un filtro LDAP (Lightweight Directory Access Protocol). LDAP es el protocolo estandar para directorios de usuarios en entornos corporativos: Active Directory de Microsoft, OpenLDAP, Oracle Directory Server. Las aplicaciones empresariales lo usan para autenticacion y autorizacion (SSO, LDAP bind).
 
-Este patron fue popularizado por Ruby on Rails antes de la proteccion con `attr_accessible`. El CVE-2012-2660 en GitHub (entonces en Rails) permitia a cualquier usuario anadir su clave SSH publica a cualquier repositorio de GitHub. Despues de ese incidente, los frameworks modernos requieren declaracion explicita de campos permitidos.
+Los filtros LDAP tienen metacaracteres especiales: `(`, `)`, `*`, `\`, y el byte nulo `\x00`. El filtro tipico de autenticacion es `(&(uid=USUARIO)(userPassword=CONTRASENA))`, que significa "uid es USUARIO Y userPassword es CONTRASENA". Si `USUARIO` contiene `)(&`, el filtro se convierte en `(&(uid=admin)(&)(userPassword=x))`. El subfilro `(&)` siempre es verdadero, haciendo que el AND principal pase aunque la contrasena sea incorrecta.
 
-En NestJS, `@Body() body: any` acepta cualquier campo del JSON del request. Sin un DTO (Data Transfer Object) que declare exactamente que campos se esperan, campos como `isAdmin`, `role`, o `balance` pueden pasar silenciosamente al objeto de persistencia.
+LDAP Injection es menos conocida que SQL Injection pero su impacto es comparable: en entornos donde Active Directory controla acceso a sistemas criticos, un bypass de autenticacion LDAP puede dar acceso a correo corporativo, VPN, servidores de desarrollo y datos de negocio.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/profile.controller.ts`
+**Archivo:** `src/typescript/src/ldap.service.ts`
 
 ```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-@Put('/profile')
-async updateProfile(
-  @Request() req: any,
-  @Body() body: any,  // acepta cualquier campo sin restriccion
-): Promise<{ message: string }> {
-  const userId = req.user?.id ?? 'user-1';
-  Object.assign(this.users[userId], body);  // copia TODO el body al objeto de usuario
-  return { message: 'Perfil actualizado' };
+async authenticate(username: string, password: string): Promise<boolean> {
+    const filter = `(&(uid=${username})(userPassword=${password}))`;
+    const results = this.search(filter);
+    return results.length > 0;
 }
 ```
 
-El objeto de usuario tiene `{id, username, email, isAdmin: false, role: 'user'}`. Con `Object.assign(user, body)`, si `body` contiene `{isAdmin: true, role: 'admin'}`, esos campos se copian al usuario.
+Con `username = "admin"` y `password = "pass"`, el filtro es correcto:
+```
+(&(uid=admin)(userPassword=pass))
+```
+
+Con `username = "admin)(&"` y `password = "x"`, el filtro es:
+```
+(&(uid=admin)(&)(userPassword=x))
+```
+El `(&)` es un filtro AND vacio que siempre es verdadero, ignorando la condicion `userPassword=x`.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Escalada de privilegios a administrador:**
+**Bypass de autenticacion con payload en username:**
 ```json
-PUT /users/profile
-Content-Type: application/json
-
-{
-  "displayName": "Alice Updated",
-  "isAdmin": true,
-  "role": "admin"
-}
+POST /auth/ldap
+{"username": "admin)(&", "password": "cualquier_cosa"}
 ```
 
-El servidor actualiza `displayName` (campo legitimo) pero tambien `isAdmin` y `role`. Alice es ahora administradora.
+El filtro resultante: `(&(uid=admin)(&)(userPassword=cualquier_cosa))`  
+El primer AND evalua: `(uid=admin) AND (&)` — como `(&)` siempre es true, la condicion pasa.
 
-**Modificacion del balance de cuenta:**
+**Bypass con wildcard en password:**
 ```json
-{
-  "email": "alice@example.com",
-  "balance": 1000000,
-  "creditLimit": 50000
-}
+{"username": "admin", "password": "*"}
 ```
+El filtro: `(&(uid=admin)(userPassword=*))` — `*` en LDAP significa "tiene algun valor". Cualquier usuario con password no nulo pasa.
 
-**Tomar control de otra cuenta (si el ID de usuario esta en el body):**
+**Enumeracion de usuarios con wildcard:**
 ```json
-{
-  "email": "attacker@example.com",
-  "id": "user-admin-id-123"
-}
+{"username": "a*", "password": "x))(|(uid=*"}
 ```
+El filtro: `(&(uid=a*)(userPassword=x))(|(uid=*))`  
+La parte `(|(uid=*))` devuelve todos los usuarios, ignorando el resto del filtro.
 
-Si el codigo hace `Object.assign(targetUser, body)` y `targetUser` se carga via `req.user.id`, pero luego el DAO actualiza usando `body.id`, el atacante puede cambiar el ID efectivo del update.
+**Extraccion de atributos con injection:**
+```json
+{"username": "admin)(|(description=*", "password": "x))(&(uid=*"}
+```
+Permite extraer atributos del directorio paso a paso (Blind LDAP Injection).
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/profile.controller.ts` para declarar un DTO que permite solo campos especificos:
+Modifica `src/typescript/src/ldap.service.ts` para escapar los metacaracteres de LDAP:
 
 ```typescript
 // CODIGO SEGURO
-import { Body, Controller, Put, Request } from '@nestjs/common';
-import { IsEmail, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
-import { instanceToPlain } from 'class-transformer';
+import { Injectable } from '@nestjs/common';
 
-// DTO que declara EXACTAMENTE que campos puede actualizar el usuario
-// Campos como isAdmin, role, id, balance no estan aqui y son ignorados
-class UpdateProfileDto {
-  @IsOptional()
-  @IsString()
-  @MinLength(1)
-  @MaxLength(50)
-  displayName?: string;
+@Injectable()
+export class LdapService {
+  private readonly directory = [
+    { uid: 'alice', userPassword: 'pass1', cn: 'Alice Smith', role: 'user' },
+    { uid: 'admin', userPassword: 'adminpass', cn: 'Admin User', role: 'admin' },
+  ];
 
-  @IsOptional()
-  @IsEmail()
-  email?: string;
+  // Escapar los 5 metacaracteres especiales de filtros LDAP (RFC 4515)
+  private escapeLdapFilter(value: string): string {
+    return value
+      .replace(/\\/g, '\\5C')   // \ → \5C  (debe ser primero para no escapar los otros escapes)
+      .replace(/\*/g, '\\2A')   // * → \2A
+      .replace(/\(/g, '\\28')   // ( → \28
+      .replace(/\)/g, '\\29')   // ) → \29
+      .replace(/\x00/g, '\\00'); // NUL → \00
+  }
 
-  @IsOptional()
-  @IsString()
-  @MaxLength(200)
-  bio?: string;
-}
+  private search(filter: string): Array<Record<string, string>> {
+    const matchUid = filter.match(/\(uid=([^)]*)\)/);
+    const matchPass = filter.match(/\(userPassword=([^)]*)\)/);
+    if (!matchUid || !matchPass) return [];
+    return this.directory.filter(
+      e => e.uid === matchUid[1] && e.userPassword === matchPass[1],
+    );
+  }
 
-@Controller('users')
-export class ProfileController {
-  private readonly users: Record<string, Record<string, unknown>> = {
-    'user-1': { id: 'user-1', username: 'alice', email: 'alice@example.com', isAdmin: false, role: 'user' },
-    'user-2': { id: 'user-2', username: 'bob', email: 'bob@example.com', isAdmin: false, role: 'user' },
-  };
-
-  @Put('/profile')
-  async updateProfile(
-    @Request() req: any,
-    @Body() dto: UpdateProfileDto,  // NestJS valida el tipo automaticamente con ValidationPipe global
-  ): Promise<{ message: string }> {
-    const userId = req.user?.id ?? 'user-1';
-    // instanceToPlain serializa solo las propiedades declaradas en el DTO
-    // isAdmin, role, id y cualquier otro campo extra son omitidos
-    const safeFields = instanceToPlain(dto);
-    Object.assign(this.users[userId], safeFields);
-    return { message: 'Perfil actualizado' };
+  async authenticate(username: string, password: string): Promise<boolean> {
+    // Escapar ANTES de interpoler en el filtro
+    const safeUser = this.escapeLdapFilter(username);
+    const safePass = this.escapeLdapFilter(password);
+    const filter = `(&(uid=${safeUser})(userPassword=${safePass}))`;
+    const results = this.search(filter);
+    return results.length > 0;
   }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **DTO tipado con class-validator:** `UpdateProfileDto` es una clase con decoradores de validacion. Solo tiene tres campos: `displayName`, `email`, `bio`. Cualquier otro campo del JSON del request es ignorado por NestJS al deserializar en una instancia del DTO.
-- **`instanceToPlain`:** convierte la instancia del DTO a un objeto plano conteniendo solo las propiedades declaradas en la clase. Aunque el atacante haya enviado `isAdmin: true`, ese campo no existe en `UpdateProfileDto` y no aparece en el objeto resultante de `instanceToPlain`.
-- **`ValidationPipe` global en NestJS:** al configurar `app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))`, NestJS rechaza automaticamente cualquier peticion con campos no declarados en el DTO. `whitelist: true` elimina campos extra silenciosamente; `forbidNonWhitelisted: true` devuelve `400 Bad Request`.
+- **`escapeLdapFilter` segun RFC 4515:** los caracteres especiales de filtros LDAP se representan con su escape `\XX` hexadecimal. `(` → `\28`, `)` → `\29`, `*` → `\2A`, `\` → `\5C`. El servidor LDAP descodifica estos escapes antes de evaluar el filtro, pero no los interpreta como metacaracteres.
+- **El orden importa:** `\` debe escaparse primero (`\5C`) para no escapar dos veces los escapes que se generan a continuacion.
+- **Escapar TODOS los valores, no solo los "sospechosos":** cualquier campo del usuario que entre en el filtro debe escaparse, incluyendo los que vienen de la base de datos (para prevenir Second-Order LDAP Injection).
+- **Alternativa: LDAP Bind en lugar de filter de busqueda:** en lugar de construir un filtro con la contrasena, autenticar directamente con LDAP Bind (`ldapClient.bind(dn, password)`). LDAP Bind no usa filtros de busqueda, eliminando el vector de injection para la verificacion de contrasena.
 
 ---
 
-## Variantes de la misma categoria (Mass Assignment — otros frameworks)
+## Variantes de la misma categoria (Injection en directorios y servicios de identidad)
 
-### Variante A: Mass Assignment en Django con ModelSerializer
+### Variante A: LDAP Injection en busquedas de usuario (no solo autenticacion)
 
-```python
-# VULNERABLE — DRF ModelSerializer sin campos restringidos
-class UserSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = '__all__'  # expone TODOS los campos del modelo incluyendo is_staff
-
-@api_view(['PUT'])
-def update_profile(request):
-    serializer = UserSerializer(request.user, data=request.data, partial=True)
-    if serializer.is_valid():
-        serializer.save()  # puede actualizar is_staff, is_superuser, etc.
-```
-
-```python
-# SEGURO — declarar explicitamente los campos permitidos
-class UpdateProfileSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ['first_name', 'last_name', 'email']  # solo campos seguros
-        # is_staff, is_superuser, password NO estan en esta lista
-
-@api_view(['PUT'])
-def update_profile(request):
-    serializer = UpdateProfileSerializer(request.user, data=request.data, partial=True)
-    if serializer.is_valid():
-        serializer.save()
-```
-
----
-
-### Variante B: Mass Assignment en Spring Boot con @RequestBody sin @JsonIgnore
-
-```java
-// VULNERABLE — entidad JPA usada directamente como @RequestBody
-@Entity
-public class User {
-    @Id private Long id;
-    private String email;
-    @JsonProperty(access = JsonProperty.Access.READ_ONLY)  // esto no protege en writes
-    private boolean isAdmin;  // Jackson puede setear este campo desde el JSON
-}
-
-@PutMapping("/profile")
-public User updateProfile(@RequestBody User user) {
-    return userRepository.save(user);  // persiste isAdmin si vino en el JSON
+```typescript
+// VULNERABLE — buscar usuarios por nombre en Active Directory
+async findUsers(searchTerm: string): Promise<string[]> {
+    const filter = `(&(objectClass=user)(cn=*${searchTerm}*))`;
+    // Si searchTerm = "*)(objectClass=* el filtro revela la estructura del directorio
+    return this.ldapClient.search(filter);
 }
 ```
 
-```java
-// SEGURO — DTO separado de la entidad JPA; mapear manualmente solo campos permitidos
-public record UpdateProfileRequest(String email, String displayName) {}
-
-@PutMapping("/profile")
-public User updateProfile(@RequestBody UpdateProfileRequest req,
-                          @AuthenticationPrincipal User currentUser) {
-    currentUser.setEmail(req.email());
-    currentUser.setDisplayName(req.displayName());
-    // isAdmin no se puede cambiar porque no esta en UpdateProfileRequest
-    return userRepository.save(currentUser);
+```typescript
+// SEGURO — escapar en busquedas tambien
+async findUsers(searchTerm: string): Promise<string[]> {
+    const safe = this.escapeLdapFilter(searchTerm);
+    const filter = `(&(objectClass=user)(cn=*${safe}*))`;
+    return this.ldapClient.search(filter);
 }
 ```
 
 ---
 
-### Variante C: Mass Assignment en GraphQL mutations
+### Variante B: XPath Injection (similar concepto, diferente tecnologia)
 
-```graphql
-# VULNERABLE — mutation que acepta cualquier campo del tipo User
-type Mutation {
-  updateUser(input: UserInput!): User
-}
-input UserInput {
-  email: String
-  displayName: String
-  isAdmin: Boolean    # el cliente puede enviar este campo
-  role: String        # y este
+```typescript
+// VULNERABLE — consulta XPath con input del usuario sin escapar
+// XPath se usa en APIs SOAP/XML, servicios de directorio XML, selectores de documentos
+async findUser(username: string, password: string): Promise<boolean> {
+    const xpath = `//user[name/text()='${username}' and password/text()='${password}']`;
+    // Payload: username = "' or '1'='1"
+    // XPath: //user[name/text()='' or '1'='1' and password/text()='x']
+    const result = this.xmlDoc.evaluate(xpath, ...);
+    return result.iterateNext() !== null;
 }
 ```
 
-```graphql
-# SEGURO — mutation con input type que solo expone campos editables por el usuario
-type Mutation {
-  updateMyProfile(input: UpdateProfileInput!): User
+```typescript
+// SEGURO — parametrizar la consulta XPath (XPath variables)
+async findUser(username: string, password: string): Promise<boolean> {
+    // Algunas librerias XPath soportan variables: $username en el query
+    const xpath = `//user[name/text()=$username and password/text()=$password]`;
+    const result = this.xmlDoc.evaluate(xpath, this.xmlDoc, {
+        lookupVariable: (name) => name === 'username' ? username : password
+    }, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    return result.singleNodeValue !== null;
 }
-input UpdateProfileInput {
-  email: String       # el usuario puede cambiar su email
-  displayName: String # y su nombre de pantalla
-  # isAdmin y role NO estan en este input type
-  # Los admins tienen su propia mutation protegida por roles
-}
+```
+
+---
+
+### Variante C: SAML Injection — manipulacion de assertions XML
+
+```xml
+<!-- VULNERABLE — assertion SAML construida con string concatenation -->
+<!-- Si username contiene </NameID><NameID>admin -->
+<!-- La assertion XML resultante tiene un NameID extra que algunos parsers aceptan -->
+<samlp:Response>
+  <Assertion>
+    <Subject>
+      <NameID>usuario_normal</NameID><NameID>admin</NameID>  <!-- injection -->
+    </Subject>
+  </Assertion>
+</samlp:Response>
+```
+
+```typescript
+// SEGURO — usar librerias SAML establecidas que manejan la construccion XML
+// nunca concatenar strings para generar XML/SAML
+import { SamlStrategy } from '@node-saml/passport-saml';
+// saml-lib construye las assertions con encoding correcto
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
-- [CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes](https://cwe.mitre.org/data/definitions/915.html)
-- [OWASP Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)
-- [GitHub Mass Assignment (Rails CVE-2012-2660)](https://github.blog/2012-03-04-public-key-security-vulnerability-and-mitigation/)
+- [OWASP A03:2021 - Injection](https://owasp.org/Top10/A03_2021-Injection/)
+- [CWE-90: LDAP Injection](https://cwe.mitre.org/data/definitions/90.html)
+- [RFC 4515 - Lightweight Directory Access Protocol: String Representation of Search Filters](https://www.rfc-editor.org/rfc/rfc4515)
+- [OWASP LDAP Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/LDAP_Injection_Prevention_Cheat_Sheet.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 29** exige que `src/typescript/src/profile.controller.ts` contenga:
-- `UpdateProfileDto`
-- `instanceToPlain`
-- La ausencia de `@Body() body: any`
+El workflow **Validate Step 30** exige que `src/typescript/src/ldap.service.ts` contenga:
+- `escapeLdapFilter`
+- `\\28`
+- La ausencia de `` `(&(uid=${username}) ``
