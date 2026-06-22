@@ -56,9 +56,13 @@ func GetOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	order := findOrderByID(orderID)
-
-	if order == nil || order.UserID != authenticatedUserID {
+	if order == nil {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if order.UserID != authenticatedUserID {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
