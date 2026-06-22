@@ -1,197 +1,187 @@
-# Paso 18 — Sensitive Data in Logs
-**Tecnologia:** TypeScript / NestJS | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-532**
+# Paso 19 — Hardcoded Secrets
+**Tecnologia:** TypeScript / NestJS | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-798**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Sensitive Data in Logs ocurre cuando una aplicacion escribe en sus registros datos que deben permanecer confidenciales: contrasenas, tokens de autenticacion, numeros de tarjeta, PINs, claves API, codigos OTP, respuestas de seguridad o cualquier dato de identificacion personal (PII).
+Hardcoded Secrets ocurre cuando credenciales, claves criptograficas, tokens o contrasenas se escriben directamente en el codigo fuente. El problema fundamental es que el codigo fuente es compartido: entre desarrolladores, en repositorios (incluyendo GitHub), en builds, en contenedores Docker y en backups.
 
-Los sistemas de logging centralizado (Splunk, ELK Stack, CloudWatch, Datadog, Grafana Loki) almacenan logs de muchos servicios y son accedidos por equipos de operaciones, seguridad y desarrollo. Un ingeniero con acceso al sistema de observabilidad puede ver accidentalmente (o intencionadamente) credenciales reales de usuarios.
+A diferencia de una contrasena de usuario que puede cambiarse, un secreto hardcodeado en el historial de git es permanente: aunque se elimine en un commit posterior, sigue siendo accesible en los commits anteriores. Herramientas como `git log`, `git show` o servicios como GitGuardian o TruffleHog escanean repositorios buscando patrones de secretos.
 
-Aunque el programador no tiene intencion maliciosa, un `console.log(request.body)` o `logger.info(JSON.stringify(payload))` puede exponer contrasenas de miles de usuarios. Las brechas de datos por logs mal configurados son frecuentes y de dificil deteccion porque el log suele considerarse "seguro por estar en el backend".
+Según el State of Secrets Sprawl 2023 de GitGuardian, se detectan mas de 10 millones de secretos hardcodeados en repositorios publicos de GitHub cada ano. Las consecuencias van desde acceso no autorizado a APIs de pago (coste economico directo) hasta robo de datos de usuarios y clientes.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/logs.service.ts`
+**Archivo:** `src/typescript/src/config.service.ts`
 
 ```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-@Injectable()
-export class LogsService {
-  private readonly logger = new Logger(LogsService.name);
+const JWT_SECRET = 'super-secret-key-hardcoded-123';  // en el historial de git para siempre
+const DB_PASSWORD = 'admin1234';                       // visible para todos los desarrolladores
+const STRIPE_KEY = 'sk_live_hardcoded_key_abc123';     // clave de produccion en el codigo
 
-  logRequest(body: unknown): void {
-    this.logger.log(JSON.stringify(body));  // serializa el body completo, incluyendo contrasenas
-  }
+@Injectable()
+export class ConfigService {
+  get jwtSecret(): string { return JWT_SECRET; }
+  get dbPassword(): string { return DB_PASSWORD; }
+  get stripeKey(): string { return STRIPE_KEY; }
 }
 ```
 
-Si un controlador llama a `logRequest({ username: 'alice', password: 's3cr3t' })`, el log contendra:
-```
-INFO [LogsService] {"username":"alice","password":"s3cr3t"}
-```
-
-Esta linea queda persistida en el sistema de logging y es accesible para cualquier persona con acceso a los logs, para siempre.
+Cualquier desarrollador que haga `git clone` o `git log` tiene acceso a `sk_live_hardcoded_key_abc123`, una clave de Stripe de produccion que permite hacer cargos y acceder a datos de clientes.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Escenario 1: Insider threat — empleado con acceso a Splunk/ELK:**
+**Busqueda en repositorios publicos:**
+```bash
+# GitHub Search: buscar patrones de claves Stripe en repos publicos
+sk_live_ in:file
+# Encuentra miles de claves validas en repositorios publicos
 ```
-SPL (Splunk): index=api sourcetype=nodejs "password"
-# Devuelve miles de registros con contrasenas en texto plano
+
+**Extraccion del historial de git:**
+```bash
+# Incluso si el secreto fue "borrado" en un commit posterior
+git log --all --full-history -- config.service.ts
+git show <commit-hash>:src/typescript/src/config.service.ts
+# El secreto sigue visible en el historial
 ```
 
-**Escenario 2: Brecha en el sistema de logging:**
-Si el atacante obtiene acceso al sistema de logging (credenciales robadas, vulnerabilidad en Kibana, S3 bucket publico), consigue un dump masivo de credenciales sin necesidad de atacar la aplicacion principal.
+**Escaneo automatizado:**
+```bash
+# TruffleHog escanea el historial completo buscando patrones de secretos
+trufflehog git file://.
+# Detecta: SK_LIVE, AKIA (AWS), ghp_ (GitHub), etc.
+```
 
-**Escenario 3: Logs en S3 sin cifrar:**
-Muchas empresas almacenan logs en S3 para retension a largo plazo. Un bucket mal configurado puede exponer meses o anos de logs con datos sensibles.
-
-**Escenario 4: Logs en entornos de CI/CD:**
-Si los tests de integracion hacen requests con datos reales y los logs se exponen en GitHub Actions, Circle CI o similar, las contrasenas quedan en los logs publicos del build.
+**Acceso via Docker image:**
+```bash
+# Si el codigo se incluye en una imagen Docker publica
+docker pull empresa/api:latest
+docker run empresa/api cat /app/src/config.service.js  # secretos en texto plano
+```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/logs.service.ts` para redactar campos sensibles antes de loguear:
+Modifica `src/typescript/src/config.service.ts` para leer secretos desde variables de entorno y fallar al arranque si faltan:
 
 ```typescript
 // CODIGO SEGURO
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 
-// Conjunto de campos que nunca deben aparecer en logs
-const SENSITIVE_FIELDS = new Set([
-  'password', 'passwd', 'secret', 'token', 'apiKey', 'api_key',
-  'authorization', 'creditCard', 'cardNumber', 'cvv', 'ssn',
-  'pin', 'otp', 'privateKey', 'accessToken', 'refreshToken',
-]);
+// Leer un secreto obligatorio desde entorno. Falla al arrancar si no esta definido.
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    // Fallar en startup es correcto: mejor no arrancar que operar sin secretos
+    throw new Error(`Variable de entorno requerida no esta definida: ${name}`);
+  }
+  return value;
+}
 
 @Injectable()
-export class LogsService {
-  private readonly logger = new Logger(LogsService.name);
-
-  // Redactar campos sensibles de forma recursiva en objetos anidados
-  private redact(obj: unknown): unknown {
-    if (typeof obj !== 'object' || obj === null) return obj;
-    if (Array.isArray(obj)) return obj.map(item => this.redact(item));
-
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      if (SENSITIVE_FIELDS.has(key.toLowerCase())) {
-        result[key] = '[REDACTED]';
-      } else {
-        result[key] = this.redact(value);
-      }
-    }
-    return result;
-  }
-
-  logRequest(body: unknown): void {
-    this.logger.log(JSON.stringify(this.redact(body)));  // body redactado
-  }
+export class ConfigService {
+  // Los secretos se resuelven al instanciar el servicio (al arranque de la app)
+  readonly jwtSecret: string = requireEnv('JWT_SECRET');
+  readonly dbPassword: string = requireEnv('DB_PASSWORD');
+  readonly stripeKey: string = requireEnv('STRIPE_API_KEY');
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`SENSITIVE_FIELDS`:** lista de claves conocidas que contienen datos sensibles. Cualquier campo cuyo nombre este en esta lista sera reemplazado por `[REDACTED]` antes de serializar.
-- **`redact` recursivo:** procesa objetos anidados. Si el body tiene `{ user: { credentials: { password: 'x' } } }`, el `password` anidado tambien sera redactado.
-- **Case-insensitive (`key.toLowerCase()`):** un campo llamado `Password`, `PASSWORD` o `pAsSwOrD` tambien sera redactado. Los desarrolladores usan convenciones diferentes.
-- **Redaccion en la fuente, no en el destino:** es mejor no escribir el dato que filtrarlo despues. Los sistemas SIEM con reglas de redaccion son una segunda linea de defensa, nunca la primera.
+- **Variables de entorno:** los secretos existen solo en el entorno de ejecucion, no en el codigo. No aparecen en `git log`, no van en imagenes Docker, no se comparten con el repositorio.
+- **`requireEnv` que falla al arranque:** si falta una variable de entorno critica, la aplicacion no arranca. Esto es el comportamiento correcto: es mejor un error obvio en startup que operar silenciosamente sin autenticacion JWT o con credenciales incorrectas.
+- **Separacion de codigo y configuracion:** el codigo define que secreto necesita pero no su valor. El valor se inyecta desde el entorno (Kubernetes Secrets, AWS Secrets Manager, HashiCorp Vault, `.env` local en desarrollo).
 
 ---
 
-## Variantes de la misma categoria (Cryptographic Failures / Data Exposure — mas complejas)
+## Variantes de la misma categoria (Cryptographic Failures via Secrets — mas complejas)
 
-### Variante A: Datos sensibles en mensajes de error
+### Variante A: Secretos en archivos .env commiteados al repositorio
 
-```typescript
-// VULNERABLE — exponer stack trace y datos internos en respuestas de error
-@Controller('payments')
-export class PaymentsController {
-  @Post('/charge')
-  async charge(@Body() body: ChargeDto) {
-    try {
-      return await this.stripeService.charge(body);
-    } catch (error) {
-      // El error puede incluir el payload completo enviado a Stripe (con datos de tarjeta)
-      throw new HttpException(error.message, 500);  // expone info de Stripe
-    }
-  }
-}
+```bash
+# .gitignore correcto pero .env fue commitado antes de anadirlo al .gitignore
+$ git log --all -- .env
+commit abc123 Author: dev@empresa.com
+    "Add initial config"
+    +DATABASE_URL=postgres://admin:S3cr3tP4ss@prod-db.empresa.com/mydb
+    +STRIPE_SECRET_KEY=sk_live_abc123xyz
 ```
 
-Si Stripe devuelve un error que incluye los datos de la peticion (numero de tarjeta, CVV), estos se propagan al cliente.
+El `.env` fue borrado del working directory pero sigue en el historial.
 
-```typescript
-// SEGURO — loguear el error internamente, devolver mensaje generico al cliente
-@Post('/charge')
-async charge(@Body() body: ChargeDto) {
-  try {
-    return await this.stripeService.charge(body);
-  } catch (error) {
-    // Loguear el error completo internamente (sin datos de tarjeta en el body)
-    this.logger.error('Stripe charge failed', { errorCode: error.code });
-    // Al cliente solo un mensaje generico sin detalles internos
-    throw new HttpException('Payment processing failed', 500);
-  }
-}
+```bash
+# Mitigacion: borrar el archivo del historial completo de git
+git filter-branch --force --index-filter \
+  'git rm --cached --ignore-unmatch .env' \
+  --prune-empty --tag-name-filter cat -- --all
+# Revocar e invalidar todos los secretos expuestos inmediatamente
+# Los secretos en historial se consideran comprometidos aunque se eliminen
 ```
 
 ---
 
-### Variante B: JWT payload almacenado en logs
+### Variante B: Secretos en variables de entorno de CI/CD expuestos en logs
 
-```typescript
-// VULNERABLE — loguear el token JWT completo
-@Get('/profile')
-async getProfile(@Headers('authorization') auth: string) {
-  this.logger.log(`Request with token: ${auth}`);  // Bearer eyJhbG...
-  const user = this.jwtService.verify(auth.replace('Bearer ', ''));
-  return user;
-}
+```yaml
+# VULNERABLE — imprimir variables de entorno en CI logs
+- name: Debug environment
+  run: env  # imprime TODAS las variables de entorno, incluyendo secretos
+
+# O accidentalmente:
+- name: Build
+  run: npm run build -- --verbose
+  env:
+    STRIPE_KEY: ${{ secrets.STRIPE_KEY }}
+# Si el build falla y imprime argv, STRIPE_KEY puede aparecer en los logs
 ```
 
-El token JWT en los logs puede ser reutilizado por alguien con acceso a los logs para autenticarse hasta que expire.
-
-```typescript
-// SEGURO — loguear solo el subject del token, nunca el token completo
-@Get('/profile')
-async getProfile(@Headers('authorization') auth: string) {
-  const token = auth?.replace('Bearer ', '') || '';
-  const payload = this.jwtService.verify(token);
-  // Solo loguear el ID del usuario, nunca el token completo
-  this.logger.log(`Profile request for user: ${payload.sub}`);
-  return payload;
-}
+```yaml
+# SEGURO — usar secrets de GitHub Actions / GitLab CI correctamente
+- name: Build
+  run: npm run build
+  env:
+    STRIPE_KEY: ${{ secrets.STRIPE_KEY }}  # GitHub enmascara el valor en logs
+# Nunca imprimir secrets con echo, env, o --verbose que exponga argumentos
 ```
 
 ---
 
-### Variante C: PII en query parameters que van a access logs
+### Variante C: Secretos hardcodeados en imagenes Docker via ARG
 
+```dockerfile
+# VULNERABLE — secreto pasado como ARG queda en las capas de la imagen
+FROM node:18-alpine
+ARG STRIPE_KEY
+ENV STRIPE_KEY=$STRIPE_KEY  # persiste en cada capa de la imagen
+COPY . .
+RUN npm install
 ```
-# VULNERABLE — datos sensibles en la URL que el servidor web registra automaticamente
-GET /api/users/search?ssn=123-45-6789&dob=1980-01-01
+
+```bash
+# El secreto es visible en los metadatos de la imagen
+docker inspect empresa/api:latest | grep -i stripe
+# O en el historial de capas:
+docker history empresa/api:latest --no-trunc
 ```
 
-Los servidores web (Nginx, Apache, AWS ALB) registran la URL completa en access logs. El numero de seguro social va a los access logs automaticamente, sin que el desarrollador haga nada.
-
-```
-# SEGURO — datos sensibles en el cuerpo de la peticion POST, no en la URL
-POST /api/users/search
-Content-Type: application/json
-
-{"ssn": "123-45-6789", "dob": "1980-01-01"}
-
-# Y configurar el servidor para no loguear el cuerpo de la peticion
-# O usar log scrubbing en el pipeline de ingestion de logs
+```dockerfile
+# SEGURO — nunca pasar secretos como ARG/ENV en tiempo de build
+# Los secretos se inyectan en tiempo de ejecucion via el orquestador
+FROM node:18-alpine
+COPY . .
+RUN npm install
+CMD ["node", "dist/main.js"]
+# Al ejecutar: docker run -e STRIPE_KEY=... empresa/api
+# O en Kubernetes: usar secretos de k8s montados como variables de entorno
 ```
 
 ---
@@ -199,16 +189,16 @@ Content-Type: application/json
 ## Referencias
 
 - [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
-- [CWE-532: Insertion of Sensitive Information into Log File](https://cwe.mitre.org/data/definitions/532.html)
-- [OWASP Sensitive Data Exposure](https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure)
-- [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
+- [GitGuardian - State of Secrets Sprawl 2023](https://www.gitguardian.com/state-of-secrets-sprawl)
+- [OWASP Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 18** exige que `src/typescript/src/logs.service.ts` contenga:
-- `SENSITIVE_FIELDS`
-- `[REDACTED]`
-- `this.redact(body)`
-- La ausencia de `JSON.stringify(body)`
+El workflow **Validate Step 19** exige que `src/typescript/src/config.service.ts` contenga:
+- `process.env[name]`
+- `requireEnv`
+- `STRIPE_API_KEY`
+- La ausencia de secretos hardcodeados conocidos
