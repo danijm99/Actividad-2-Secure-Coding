@@ -9,9 +9,9 @@ import (
 )
 
 type Order struct {
-	ID     string `json:"id"`
-	UserID string `json:"user_id"`
-	Total  float64 `json:"total"`
+	ID     string   `json:"id"`
+	UserID string   `json:"user_id"`
+	Total  float64  `json:"total"`
 	Items  []string `json:"items"`
 }
 
@@ -48,10 +48,19 @@ func findOrderByID(id string) *Order {
 
 func GetOrder(w http.ResponseWriter, r *http.Request) {
 	orderID := r.URL.Query().Get("id")
+
+	authenticatedUserID := r.Header.Get("X-User-ID")
+	if authenticatedUserID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	order := findOrderByID(orderID)
-	if order == nil {
+
+	if order == nil || order.UserID != authenticatedUserID {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+
 	json.NewEncoder(w).Encode(order)
 }
