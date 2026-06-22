@@ -1,236 +1,229 @@
-# Paso 28 — SSRF via HTTP Client (TypeScript)
-**Tecnologia:** TypeScript / NestJS + axios | **OWASP:** A10:2021 - SSRF | **CWE-918**
+# Paso 29 — Mass Assignment
+**Tecnologia:** TypeScript / NestJS | **OWASP:** A01:2021 - Broken Access Control | **CWE-915**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Esta es la segunda instancia de SSRF en el tutorial, ahora en el contexto de TypeScript/NestJS con la libreria `axios`. Aunque el principio es el mismo que en el step 23, en ecosistemas Node.js hay vectores adicionales: las URLs con schema `file://` en algunas versiones, los redirects automaticos de axios (habilitados por defecto), y el DNS Rebinding que puede evadir validaciones basadas en el hostname si no se resuelve la IP.
+Mass Assignment ocurre cuando una aplicacion web vincula automaticamente los campos de un objeto del request HTTP a los campos de un modelo o entidad de base de datos, sin filtrar que campos el usuario tiene permiso de modificar. El atacante puede enviar campos extra en el JSON del request (como `isAdmin: true`, `role: "admin"`, `balance: 999999`) que el servidor acepta y aplica porque "mergeea" todo el body en el objeto.
 
-En arquitecturas de microservicios, un servicio NestJS que hace peticiones a otros servicios internos es muy comun. Si ese servicio expone un endpoint que permite al usuario controlar la URL destino (para integraciones con APIs externas, webhooks, importacion de datos, thumbnails), se convierte en un vector SSRF. La red interna del microservicio tiene acceso a servicios que no estan expuestos publicamente: bases de datos, caches, servicios de orquestacion (Kubernetes API server en `https://kubernetes.default.svc`).
+Este patron fue popularizado por Ruby on Rails antes de la proteccion con `attr_accessible`. El CVE-2012-2660 en GitHub (entonces en Rails) permitia a cualquier usuario anadir su clave SSH publica a cualquier repositorio de GitHub. Despues de ese incidente, los frameworks modernos requieren declaracion explicita de campos permitidos.
+
+En NestJS, `@Body() body: any` acepta cualquier campo del JSON del request. Sin un DTO (Data Transfer Object) que declare exactamente que campos se esperan, campos como `isAdmin`, `role`, o `balance` pueden pasar silenciosamente al objeto de persistencia.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/proxy.controller.ts`
+**Archivo:** `src/typescript/src/profile.controller.ts`
 
 ```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-@Controller('proxy')
-export class ProxyController {
-  @Get('/fetch')
-  async fetch(@Query('url') url: string): Promise<string> {
-    const response = await axios.get(url);  // cualquier URL, sin restriccion
-    return response.data;
-  }
+@Put('/profile')
+async updateProfile(
+  @Request() req: any,
+  @Body() body: any,  // acepta cualquier campo sin restriccion
+): Promise<{ message: string }> {
+  const userId = req.user?.id ?? 'user-1';
+  Object.assign(this.users[userId], body);  // copia TODO el body al objeto de usuario
+  return { message: 'Perfil actualizado' };
 }
 ```
 
-`axios.get(url)` sigue redirects automaticamente por defecto (`maxRedirects: 5`). Esto significa que aunque se valide el host inicial, un redirect a `http://169.254.169.254/` puede bypassear la validacion si no se deshabilitan los redirects.
+El objeto de usuario tiene `{id, username, email, isAdmin: false, role: 'user'}`. Con `Object.assign(user, body)`, si `body` contiene `{isAdmin: true, role: 'admin'}`, esos campos se copian al usuario.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Acceso al Kubernetes API Server (en entornos k8s):**
-```
-GET /proxy/fetch?url=https://kubernetes.default.svc/api/v1/namespaces
-# Con el service account del pod, puede listar namespaces, pods, secrets de k8s
+**Escalada de privilegios a administrador:**
+```json
+PUT /users/profile
+Content-Type: application/json
+
+{
+  "displayName": "Alice Updated",
+  "isAdmin": true,
+  "role": "admin"
+}
 ```
 
-**Acceso a GCP Metadata Server:**
-```
-GET /proxy/fetch?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
-# Header requerido: Metadata-Flavor: Google
-# Pero con SSRF que puede controlar headers, o con versiones antiguas sin validacion
+El servidor actualiza `displayName` (campo legitimo) pero tambien `isAdmin` y `role`. Alice es ahora administradora.
+
+**Modificacion del balance de cuenta:**
+```json
+{
+  "email": "alice@example.com",
+  "balance": 1000000,
+  "creditLimit": 50000
+}
 ```
 
-**Bypass via Open Redirect:**
-```javascript
-// El atacante registra una URL en el allowlist que hace redirect a IMDS
-// Por ejemplo, si api.github.com devolviera un 301 a 169.254.169.254
-// (hipotetico, pero ilustra el vector)
-
-// En la practica: el atacante controla un dominio permitido que hace redirect
-// GET /proxy/fetch?url=https://attacker-allowed-domain.com/redirect
-// → 301 Location: http://169.254.169.254/latest/meta-data/
-// axios sigue el redirect si maxRedirects > 0
+**Tomar control de otra cuenta (si el ID de usuario esta en el body):**
+```json
+{
+  "email": "attacker@example.com",
+  "id": "user-admin-id-123"
+}
 ```
 
-**DNS Rebinding:**
-```
-// 1. Registrar ssrf-bypass.attacker.com con TTL muy bajo
-// 2. Primera resolucion DNS: ip = 1.2.3.4 (IP valida, publica)
-// 3. Servidor valida: 1.2.3.4 no es privada → permitir
-// 4. Segunda resolucion DNS (al hacer el get): ip = 169.254.169.254
-// 5. La peticion llega al IMDS aunque la validacion paso
-```
+Si el codigo hace `Object.assign(targetUser, body)` y `targetUser` se carga via `req.user.id`, pero luego el DAO actualiza usando `body.id`, el atacante puede cambiar el ID efectivo del update.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/proxy.controller.ts` para validar la URL contra allowlist y deshabilitar redirects:
+Modifica `src/typescript/src/profile.controller.ts` para declarar un DTO que permite solo campos especificos:
 
 ```typescript
 // CODIGO SEGURO
-import { BadRequestException, Controller, Get, Query } from '@nestjs/common';
-import axios from 'axios';
+import { Body, Controller, Put, Request } from '@nestjs/common';
+import { IsEmail, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { instanceToPlain } from 'class-transformer';
 
-// Lista blanca de hostnames permitidos
-const ALLOWED_HOSTS = new Set([
-  'api.github.com',
-  'jsonplaceholder.typicode.com',
-  'api.openweathermap.org',
-]);
+// DTO que declara EXACTAMENTE que campos puede actualizar el usuario
+// Campos como isAdmin, role, id, balance no estan aqui y son ignorados
+class UpdateProfileDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(50)
+  displayName?: string;
 
-@Controller('proxy')
-export class ProxyController {
-  @Get('/fetch')
-  async fetch(@Query('url') url: string): Promise<string> {
-    if (!url) {
-      throw new BadRequestException('URL requerida');
-    }
+  @IsOptional()
+  @IsEmail()
+  email?: string;
 
-    // Parsear y validar la URL antes de hacer la peticion
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      throw new BadRequestException('URL malformada');
-    }
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  bio?: string;
+}
 
-    // Solo HTTPS — previene file://, ftp://, gopher://, etc.
-    if (parsed.protocol !== 'https:') {
-      throw new BadRequestException('Solo se permite HTTPS');
-    }
+@Controller('users')
+export class ProfileController {
+  private readonly users: Record<string, Record<string, unknown>> = {
+    'user-1': { id: 'user-1', username: 'alice', email: 'alice@example.com', isAdmin: false, role: 'user' },
+    'user-2': { id: 'user-2', username: 'bob', email: 'bob@example.com', isAdmin: false, role: 'user' },
+  };
 
-    // Allowlist de hostnames — rechaza IMDS, red interna, localhost
-    if (!ALLOWED_HOSTS.has(parsed.hostname)) {
-      throw new BadRequestException('Host no permitido');
-    }
-
-    // maxRedirects: 0 — no seguir redirects que puedan apuntar a hosts internos
-    const response = await axios.get(url, { maxRedirects: 0 });
-    return response.data;
+  @Put('/profile')
+  async updateProfile(
+    @Request() req: any,
+    @Body() dto: UpdateProfileDto,  // NestJS valida el tipo automaticamente con ValidationPipe global
+  ): Promise<{ message: string }> {
+    const userId = req.user?.id ?? 'user-1';
+    // instanceToPlain serializa solo las propiedades declaradas en el DTO
+    // isAdmin, role, id y cualquier otro campo extra son omitidos
+    const safeFields = instanceToPlain(dto);
+    Object.assign(this.users[userId], safeFields);
+    return { message: 'Perfil actualizado' };
   }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`new URL(url)`:** el constructor URL de Node.js parsea la URL segun RFC 3986. Si la URL es malformada, lanza `TypeError`. Usar `new URL()` en lugar de parsear manualmente con regex evita bypasses de parsing.
-- **`ALLOWED_HOSTS`:** solo los hostnames explicitamente permitidos son aceptados. La validacion opera sobre `parsed.hostname` (el hostname real del objeto URL), no sobre el string original que podria contener encoding tricks.
-- **`maxRedirects: 0`:** axios no seguira ninguna redireccion HTTP. Si el servidor destino responde con `301/302 Location: http://169.254.169.254/`, axios lanzara un error en lugar de seguir el redirect. Esto elimina el vector de bypass via open redirect.
-- **Validacion de protocolo:** `https:` exclusivamente evita protocolos como `file://`, `ftp://`, `gopher://` y `dict://` que pueden leer archivos locales o interactuar con otros servicios.
+- **DTO tipado con class-validator:** `UpdateProfileDto` es una clase con decoradores de validacion. Solo tiene tres campos: `displayName`, `email`, `bio`. Cualquier otro campo del JSON del request es ignorado por NestJS al deserializar en una instancia del DTO.
+- **`instanceToPlain`:** convierte la instancia del DTO a un objeto plano conteniendo solo las propiedades declaradas en la clase. Aunque el atacante haya enviado `isAdmin: true`, ese campo no existe en `UpdateProfileDto` y no aparece en el objeto resultante de `instanceToPlain`.
+- **`ValidationPipe` global en NestJS:** al configurar `app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))`, NestJS rechaza automaticamente cualquier peticion con campos no declarados en el DTO. `whitelist: true` elimina campos extra silenciosamente; `forbidNonWhitelisted: true` devuelve `400 Bad Request`.
 
 ---
 
-## Variantes de la misma categoria (SSRF en TypeScript — vectores adicionales)
+## Variantes de la misma categoria (Mass Assignment — otros frameworks)
 
-### Variante A: SSRF via fetch en un Worker / Service sin validacion
+### Variante A: Mass Assignment en Django con ModelSerializer
 
-```typescript
-// VULNERABLE — importar datos desde URL remota en un job asynchrono
-@Injectable()
-export class DataImportService {
-  async importFromUrl(dataUrl: string): Promise<void> {
-    // Sin validacion: el payload puede ser una URL interna
-    const { data } = await axios.get(dataUrl);
-    await this.processData(data);
-  }
-}
+```python
+# VULNERABLE — DRF ModelSerializer sin campos restringidos
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = '__all__'  # expone TODOS los campos del modelo incluyendo is_staff
+
+@api_view(['PUT'])
+def update_profile(request):
+    serializer = UserSerializer(request.user, data=request.data, partial=True)
+    if serializer.is_valid():
+        serializer.save()  # puede actualizar is_staff, is_superuser, etc.
 ```
 
-```typescript
-// SEGURO — misma validacion en jobs que en endpoints HTTP
-async importFromUrl(dataUrl: string): Promise<void> {
-  const parsed = new URL(dataUrl);
-  if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
-    throw new Error('URL de importacion no permitida');
-  }
-  const { data } = await axios.get(dataUrl, { maxRedirects: 0 });
-  await this.processData(data);
-}
+```python
+# SEGURO — declarar explicitamente los campos permitidos
+class UpdateProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['first_name', 'last_name', 'email']  # solo campos seguros
+        # is_staff, is_superuser, password NO estan en esta lista
+
+@api_view(['PUT'])
+def update_profile(request):
+    serializer = UpdateProfileSerializer(request.user, data=request.data, partial=True)
+    if serializer.is_valid():
+        serializer.save()
 ```
 
 ---
 
-### Variante B: SSRF via generacion de PDF con puppeteer/playwright
+### Variante B: Mass Assignment en Spring Boot con @RequestBody sin @JsonIgnore
 
-```typescript
-// VULNERABLE — renderizar una URL con Puppeteer (navegador sin restricciones)
-@Post('/generate-pdf')
-async generatePdf(@Body('url') url: string): Promise<Buffer> {
-  const browser = await puppeteer.launch();
-  const page = await browser.newPage();
-  await page.goto(url);  // accede a cualquier URL, incluyendo internas
-  return page.pdf();
+```java
+// VULNERABLE — entidad JPA usada directamente como @RequestBody
+@Entity
+public class User {
+    @Id private Long id;
+    private String email;
+    @JsonProperty(access = JsonProperty.Access.READ_ONLY)  // esto no protege en writes
+    private boolean isAdmin;  // Jackson puede setear este campo desde el JSON
+}
+
+@PutMapping("/profile")
+public User updateProfile(@RequestBody User user) {
+    return userRepository.save(user);  // persiste isAdmin si vino en el JSON
 }
 ```
 
-Payload: `url=file:///etc/passwd` — Puppeteer lee el archivo local y lo convierte a PDF.
+```java
+// SEGURO — DTO separado de la entidad JPA; mapear manualmente solo campos permitidos
+public record UpdateProfileRequest(String email, String displayName) {}
 
-```typescript
-// SEGURO — allowlist + bloquear protocolos de archivo en la pagina
-async generatePdf(@Body('url') url: string): Promise<Buffer> {
-  const parsed = new URL(url);
-  if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
-    throw new BadRequestException('URL no permitida para PDF');
-  }
-  const browser = await puppeteer.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox',
-           '--disable-dev-shm-usage']
-  });
-  const page = await browser.newPage();
-  // Interceptar y bloquear requests a hosts no permitidos
-  await page.setRequestInterception(true);
-  page.on('request', req => {
-    const u = new URL(req.url());
-    if (u.protocol !== 'https:' || !ALLOWED_HOSTS.has(u.hostname)) {
-      req.abort();
-    } else {
-      req.continue();
-    }
-  });
-  await page.goto(url);
-  return page.pdf();
+@PutMapping("/profile")
+public User updateProfile(@RequestBody UpdateProfileRequest req,
+                          @AuthenticationPrincipal User currentUser) {
+    currentUser.setEmail(req.email());
+    currentUser.setDisplayName(req.displayName());
+    // isAdmin no se puede cambiar porque no esta en UpdateProfileRequest
+    return userRepository.save(currentUser);
 }
 ```
 
 ---
 
-### Variante C: SSRF en integraciones con servicios de terceros (webhooks entrantes)
+### Variante C: Mass Assignment en GraphQL mutations
 
-```typescript
-// VULNERABLE — reenviar webhook de proveedor externo a URL interna
-@Post('/webhook/forward')
-async forwardWebhook(
-  @Body('destination') destination: string,
-  @Body('payload') payload: unknown,
-): Promise<void> {
-  // Sin validacion: destination puede ser http://internal-service:8080/admin
-  await axios.post(destination, payload);
+```graphql
+# VULNERABLE — mutation que acepta cualquier campo del tipo User
+type Mutation {
+  updateUser(input: UserInput!): User
+}
+input UserInput {
+  email: String
+  displayName: String
+  isAdmin: Boolean    # el cliente puede enviar este campo
+  role: String        # y este
 }
 ```
 
-```typescript
-// SEGURO — validar destination con allowlist + solo POST a endpoints declarados
-const WEBHOOK_DESTINATIONS = new Set([
-  'https://crm.empresa.com/webhooks/incoming',
-  'https://slack.com/services/hooks',
-]);
-
-@Post('/webhook/forward')
-async forwardWebhook(
-  @Body('destination') destination: string,
-  @Body('payload') payload: unknown,
-): Promise<void> {
-  if (!WEBHOOK_DESTINATIONS.has(destination)) {
-    throw new BadRequestException('Destino de webhook no autorizado');
-  }
-  await axios.post(destination, payload, { maxRedirects: 0 });
+```graphql
+# SEGURO — mutation con input type que solo expone campos editables por el usuario
+type Mutation {
+  updateMyProfile(input: UpdateProfileInput!): User
+}
+input UpdateProfileInput {
+  email: String       # el usuario puede cambiar su email
+  displayName: String # y su nombre de pantalla
+  # isAdmin y role NO estan en este input type
+  # Los admins tienen su propia mutation protegida por roles
 }
 ```
 
@@ -238,17 +231,16 @@ async forwardWebhook(
 
 ## Referencias
 
-- [OWASP A10:2021 - SSRF](https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/)
-- [CWE-918: Server-Side Request Forgery](https://cwe.mitre.org/data/definitions/918.html)
-- [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
-- [AWS IMDSv2 - Mitigacion de SSRF en EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+- [OWASP A01:2021 - Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
+- [CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes](https://cwe.mitre.org/data/definitions/915.html)
+- [OWASP Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)
+- [GitHub Mass Assignment (Rails CVE-2012-2660)](https://github.blog/2012-03-04-public-key-security-vulnerability-and-mitigation/)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 28** exige que `src/typescript/src/proxy.controller.ts` contenga:
-- `ALLOWED_HOSTS`
-- `new URL(url)`
-- `maxRedirects`
-- La ausencia de `await axios.get(url);`
+El workflow **Validate Step 29** exige que `src/typescript/src/profile.controller.ts` contenga:
+- `UpdateProfileDto`
+- `instanceToPlain`
+- La ausencia de `@Body() body: any`
