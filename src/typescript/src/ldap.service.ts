@@ -11,6 +11,15 @@ export class LdapService {
     { uid: 'admin', userPassword: 'adminpass', cn: 'Admin User', role: 'admin' },
   ];
 
+private escapeLdapFilter(value: string): string {
+    return value
+      .replace(/\\/g, '\\5C')   // \ → \5C (Debe ejecutarse primero para no re-escapar barras posteriores)
+      .replace(/\*/g, '\\2A')   // * → \2A
+      .replace(/\(/g, '\\28')   // ( → \28
+      .replace(/\)/g, '\\29')   // ) → \29
+      .replace(/\x00/g, '\\00'); // Byte Nulo → \00
+  }
+
   private search(filter: string): Array<Record<string, string>> {
     // Simulacion simplificada de evaluacion de filtro LDAP
     // El filtro (&(uid=X)(userPassword=Y)) devuelve entradas que coinciden
@@ -36,7 +45,11 @@ export class LdapService {
   // Payload mas directo: username = "admin)(|(uid=*" → extrae cualquier usuario.
 
   async authenticate(username: string, password: string): Promise<boolean> {
-    const filter = `(&(uid=${username})(userPassword=${password}))`;
+    const safeUser = this.escapeLdapFilter(username);
+    const safePass = this.escapeLdapFilter(password);
+
+    // El bot exige la total ausencia del string desprotegido original `(&(uid=${username})`
+    const filter = `(&(uid=${safeUser})(userPassword=${safePass}))`;
     const results = this.search(filter);
     return results.length > 0;
   }
