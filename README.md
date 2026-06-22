@@ -1,227 +1,236 @@
-# Paso 27 — JWT Algorithm Confusion
-**Tecnologia:** Go / golang-jwt | **OWASP:** A07:2021 - Identification and Authentication Failures | **CWE-347**
+# Paso 28 — SSRF via HTTP Client (TypeScript)
+**Tecnologia:** TypeScript / NestJS + axios | **OWASP:** A10:2021 - SSRF | **CWE-918**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-JWT Algorithm Confusion ocurre cuando el servidor acepta tokens JWT firmados con cualquier algoritmo, incluyendo el algoritmo especial `"none"` que indica "sin firma". El campo `alg` del header JWT es controlado por el cliente — si el servidor simplemente usa el algoritmo que el token declara, un atacante puede crear tokens con `alg=none` y payload arbitrario que el servidor acepta como validos sin ninguna clave.
+Esta es la segunda instancia de SSRF en el tutorial, ahora en el contexto de TypeScript/NestJS con la libreria `axios`. Aunque el principio es el mismo que en el step 23, en ecosistemas Node.js hay vectores adicionales: las URLs con schema `file://` en algunas versiones, los redirects automaticos de axios (habilitados por defecto), y el DNS Rebinding que puede evadir validaciones basadas en el hostname si no se resuelve la IP.
 
-El segundo vector es la confusion entre algoritmos asimetricos y simetricos: si el servidor usa RSA (`RS256`) para firmar pero tambien acepta HMAC (`HS256`), un atacante puede tomar la clave publica RSA (que es publica por definicion) y usarla como clave secreta HMAC para firmar tokens fraudulentos. El servidor verifica con `HS256` usando la clave publica como secreto, que es exactamente lo que el atacante uso para firmar.
-
-JWT Algorithm Confusion fue CVE-2015-9235 en la libreria `jsonwebtoken` de Node.js y afecto a numerosas aplicaciones. La vulnerabilidad es especialmente critica porque un JWT valido por manipulacion de algoritmo permite autenticacion como cualquier usuario, incluyendo administradores.
+En arquitecturas de microservicios, un servicio NestJS que hace peticiones a otros servicios internos es muy comun. Si ese servicio expone un endpoint que permite al usuario controlar la URL destino (para integraciones con APIs externas, webhooks, importacion de datos, thumbnails), se convierte en un vector SSRF. La red interna del microservicio tiene acceso a servicios que no estan expuestos publicamente: bases de datos, caches, servicios de orquestacion (Kubernetes API server en `https://kubernetes.default.svc`).
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/go/handlers/jwt.go`
+**Archivo:** `src/typescript/src/proxy.controller.ts`
 
-```go
+```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-func ParseToken(tokenString string) (*jwt.MapClaims, error) {
-    token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-        return []byte("secret"), nil  // devuelve la clave sin verificar el algoritmo
-    })
-    if err != nil || !token.Valid {
-        return nil, fmt.Errorf("invalid token")
-    }
-    claims := token.Claims.(jwt.MapClaims)
-    return &claims, nil
+@Controller('proxy')
+export class ProxyController {
+  @Get('/fetch')
+  async fetch(@Query('url') url: string): Promise<string> {
+    const response = await axios.get(url);  // cualquier URL, sin restriccion
+    return response.data;
+  }
 }
 ```
 
-La funcion de lookup devuelve la clave sin verificar qué algoritmo usa el token. Si el header del token dice `"alg": "none"`, la libreria no necesita la clave y acepta el token.
+`axios.get(url)` sigue redirects automaticamente por defecto (`maxRedirects: 5`). Esto significa que aunque se valide el host inicial, un redirect a `http://169.254.169.254/` puede bypassear la validacion si no se deshabilitan los redirects.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Token con alg=none (sin firma):**
+**Acceso al Kubernetes API Server (en entornos k8s):**
 ```
-Header (base64url): {"alg":"none","typ":"JWT"}
-Payload (base64url): {"sub":"admin","role":"superuser","exp":9999999999}
-Firma: (cadena vacia)
-
-Token completo: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJzdXBlcnVzZXIiLCJleHAiOjk5OTk5OTk5OTl9.
+GET /proxy/fetch?url=https://kubernetes.default.svc/api/v1/namespaces
+# Con el service account del pod, puede listar namespaces, pods, secrets de k8s
 ```
 
-```bash
-# Crear el token alg=none en bash
-header=$(echo -n '{"alg":"none","typ":"JWT"}' | base64url)
-payload=$(echo -n '{"sub":"admin","role":"superuser","exp":9999999999}' | base64url)
-token="${header}.${payload}."
-curl -H "Authorization: Bearer ${token}" https://api.empresa.com/admin
+**Acceso a GCP Metadata Server:**
+```
+GET /proxy/fetch?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header requerido: Metadata-Flavor: Google
+# Pero con SSRF que puede controlar headers, o con versiones antiguas sin validacion
 ```
 
-**Algorithm Confusion RS256 → HS256:**
-```python
-# El atacante tiene acceso a la clave publica RSA del servidor (fichero .pem publico)
-import jwt
+**Bypass via Open Redirect:**
+```javascript
+// El atacante registra una URL en el allowlist que hace redirect a IMDS
+// Por ejemplo, si api.github.com devolviera un 301 a 169.254.169.254
+// (hipotetico, pero ilustra el vector)
 
-public_key = open('server_public_key.pem').read()
-# Usar la clave PUBLICA como secreto HMAC (el servidor hara lo mismo si acepta HS256)
-malicious_token = jwt.encode(
-    {"sub": "admin", "role": "admin"},
-    public_key,
-    algorithm="HS256"  # firmado con clave publica como si fuera secreto HMAC
-)
+// En la practica: el atacante controla un dominio permitido que hace redirect
+// GET /proxy/fetch?url=https://attacker-allowed-domain.com/redirect
+// → 301 Location: http://169.254.169.254/latest/meta-data/
+// axios sigue el redirect si maxRedirects > 0
+```
+
+**DNS Rebinding:**
+```
+// 1. Registrar ssrf-bypass.attacker.com con TTL muy bajo
+// 2. Primera resolucion DNS: ip = 1.2.3.4 (IP valida, publica)
+// 3. Servidor valida: 1.2.3.4 no es privada → permitir
+// 4. Segunda resolucion DNS (al hacer el get): ip = 169.254.169.254
+// 5. La peticion llega al IMDS aunque la validacion paso
 ```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/go/handlers/jwt.go` para validar explicitamente el algoritmo de firma:
+Modifica `src/typescript/src/proxy.controller.ts` para validar la URL contra allowlist y deshabilitar redirects:
 
-```go
+```typescript
 // CODIGO SEGURO
-package handlers
+import { BadRequestException, Controller, Get, Query } from '@nestjs/common';
+import axios from 'axios';
 
-import (
-    "fmt"
-    "net/http"
-    "os"
-    "strings"
+// Lista blanca de hostnames permitidos
+const ALLOWED_HOSTS = new Set([
+  'api.github.com',
+  'jsonplaceholder.typicode.com',
+  'api.openweathermap.org',
+]);
 
-    "github.com/golang-jwt/jwt/v5"
-)
-
-func ParseToken(tokenString string) (*jwt.MapClaims, error) {
-    token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-        // Verificar EXPLICITAMENTE que el algoritmo es HMAC (HS256/HS384/HS512)
-        // Si el header dice "none", RSA, ECDSA u otro, se rechaza aqui
-        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-            return nil, fmt.Errorf("algoritmo inesperado: %v", token.Header["alg"])
-        }
-        // El secreto viene de variable de entorno, nunca hardcodeado
-        return []byte(os.Getenv("JWT_SECRET")), nil
-    })
-    if err != nil || !token.Valid {
-        return nil, fmt.Errorf("invalid token")
+@Controller('proxy')
+export class ProxyController {
+  @Get('/fetch')
+  async fetch(@Query('url') url: string): Promise<string> {
+    if (!url) {
+      throw new BadRequestException('URL requerida');
     }
-    claims := token.Claims.(jwt.MapClaims)
-    return &claims, nil
-}
 
-func ValidateJWTHandler(w http.ResponseWriter, r *http.Request) {
-    authHeader := r.Header.Get("Authorization")
-    if !strings.HasPrefix(authHeader, "Bearer ") {
-        http.Error(w, "missing token", http.StatusUnauthorized)
-        return
+    // Parsear y validar la URL antes de hacer la peticion
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new BadRequestException('URL malformada');
     }
-    tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-    claims, err := ParseToken(tokenString)
-    if err != nil {
-        http.Error(w, "unauthorized", http.StatusUnauthorized)
-        return
+
+    // Solo HTTPS — previene file://, ftp://, gopher://, etc.
+    if (parsed.protocol !== 'https:') {
+      throw new BadRequestException('Solo se permite HTTPS');
     }
-    w.Header().Set("Content-Type", "application/json")
-    fmt.Fprintf(w, `{"valid":true,"sub":"%v"}`, (*claims)["sub"])
+
+    // Allowlist de hostnames — rechaza IMDS, red interna, localhost
+    if (!ALLOWED_HOSTS.has(parsed.hostname)) {
+      throw new BadRequestException('Host no permitido');
+    }
+
+    // maxRedirects: 0 — no seguir redirects que puedan apuntar a hosts internos
+    const response = await axios.get(url, { maxRedirects: 0 });
+    return response.data;
+  }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`token.Method.(*jwt.SigningMethodHMAC)` type assertion:** verifica que el algoritmo usado es de la familia HMAC (`HS256`, `HS384`, `HS512`). Si el header dice `"none"`, `"RS256"`, `"ES256"` u otro, el type assertion falla, la funcion devuelve error, y el token es rechazado antes de verificar la firma.
-- **El algoritmo se decide en el servidor, no en el token:** el servidor sabe que firma con HS256. Por tanto, solo acepta HS256. El campo `alg` del header JWT es solo informativo para seleccionar la clave correcta, nunca para cambiar la politica de seguridad del servidor.
-- **`os.Getenv("JWT_SECRET")`:** la clave secreta no esta hardcodeada en el codigo (ver step 19). Si la clave se rota, solo hay que actualizar la variable de entorno.
+- **`new URL(url)`:** el constructor URL de Node.js parsea la URL segun RFC 3986. Si la URL es malformada, lanza `TypeError`. Usar `new URL()` en lugar de parsear manualmente con regex evita bypasses de parsing.
+- **`ALLOWED_HOSTS`:** solo los hostnames explicitamente permitidos son aceptados. La validacion opera sobre `parsed.hostname` (el hostname real del objeto URL), no sobre el string original que podria contener encoding tricks.
+- **`maxRedirects: 0`:** axios no seguira ninguna redireccion HTTP. Si el servidor destino responde con `301/302 Location: http://169.254.169.254/`, axios lanzara un error en lugar de seguir el redirect. Esto elimina el vector de bypass via open redirect.
+- **Validacion de protocolo:** `https:` exclusivamente evita protocolos como `file://`, `ftp://`, `gopher://` y `dict://` que pueden leer archivos locales o interactuar con otros servicios.
 
 ---
 
-## Variantes de la misma categoria (Authentication Failures — mas complejas)
+## Variantes de la misma categoria (SSRF en TypeScript — vectores adicionales)
 
-### Variante A: JWT sin verificacion de expiracion (exp claim)
+### Variante A: SSRF via fetch en un Worker / Service sin validacion
 
-```go
-// VULNERABLE — no verificar que el token no ha expirado
-func ParseTokenNoExpCheck(tokenString string) (*jwt.MapClaims, error) {
-    p := jwt.NewParser(jwt.WithoutClaimsValidation())  // deshabilita validacion de claims
-    token, err := p.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-        if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-            return nil, fmt.Errorf("unexpected method")
-        }
-        return []byte(os.Getenv("JWT_SECRET")), nil
-    })
-    ...
+```typescript
+// VULNERABLE — importar datos desde URL remota en un job asynchrono
+@Injectable()
+export class DataImportService {
+  async importFromUrl(dataUrl: string): Promise<void> {
+    // Sin validacion: el payload puede ser una URL interna
+    const { data } = await axios.get(dataUrl);
+    await this.processData(data);
+  }
 }
 ```
 
-Un token robado sigue siendo valido indefinidamente aunque haya expirado.
-
-```go
-// SEGURO — el parser de golang-jwt valida exp, nbf, iat por defecto
-// NO usar WithoutClaimsValidation()
-// NO usar WithIssuedAt() si no se quiere validar
-token, err := jwt.Parse(tokenString, keyFunc)  // valida exp automaticamente
+```typescript
+// SEGURO — misma validacion en jobs que en endpoints HTTP
+async importFromUrl(dataUrl: string): Promise<void> {
+  const parsed = new URL(dataUrl);
+  if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new Error('URL de importacion no permitida');
+  }
+  const { data } = await axios.get(dataUrl, { maxRedirects: 0 });
+  await this.processData(data);
+}
 ```
 
 ---
 
-### Variante B: Session Fixation
+### Variante B: SSRF via generacion de PDF con puppeteer/playwright
 
-```python
-# VULNERABLE — no rotar el session ID despues del login
-@app.post("/login")
-async def login(request: Request, username: str, password: str):
-    if verify_credentials(username, password):
-        # Reutiliza el session ID existente (que el atacante puede conocer)
-        request.session["user"] = username  # session ID no cambia
-        return {"message": "Logged in"}
+```typescript
+// VULNERABLE — renderizar una URL con Puppeteer (navegador sin restricciones)
+@Post('/generate-pdf')
+async generatePdf(@Body('url') url: string): Promise<Buffer> {
+  const browser = await puppeteer.launch();
+  const page = await browser.newPage();
+  await page.goto(url);  // accede a cualquier URL, incluyendo internas
+  return page.pdf();
+}
 ```
 
-Ataque: el atacante fija un session ID conocido enviandolo a la victima. Cuando la victima hace login, el servidor asocia ese session ID conocido a la sesion autenticada.
+Payload: `url=file:///etc/passwd` — Puppeteer lee el archivo local y lo convierte a PDF.
 
-```python
-# SEGURO — regenerar el session ID despues de autenticacion exitosa
-@app.post("/login")
-async def login(request: Request, username: str, password: str):
-    if verify_credentials(username, password):
-        request.session.clear()    # eliminar la sesion anonima existente
-        request.session.regenerate_id()  # nuevo ID de sesion
-        request.session["user"] = username
-        return {"message": "Logged in"}
-```
-
----
-
-### Variante C: Brute Force en endpoints de autenticacion sin rate limiting
-
-```go
-// VULNERABLE — login sin proteccion contra fuerza bruta
-func LoginHandler(w http.ResponseWriter, r *http.Request) {
-    username := r.FormValue("username")
-    password := r.FormValue("password")
-    if checkPassword(username, password) {
-        // generar token
+```typescript
+// SEGURO — allowlist + bloquear protocolos de archivo en la pagina
+async generatePdf(@Body('url') url: string): Promise<Buffer> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new BadRequestException('URL no permitida para PDF');
+  }
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox',
+           '--disable-dev-shm-usage']
+  });
+  const page = await browser.newPage();
+  // Interceptar y bloquear requests a hosts no permitidos
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    const u = new URL(req.url());
+    if (u.protocol !== 'https:' || !ALLOWED_HOSTS.has(u.hostname)) {
+      req.abort();
     } else {
-        http.Error(w, "invalid credentials", http.StatusUnauthorized)
+      req.continue();
     }
-    // Sin contador de intentos, sin lockout, sin CAPTCHA
+  });
+  await page.goto(url);
+  return page.pdf();
 }
 ```
 
-```go
-// SEGURO — rate limiting por IP y por usuario
-var loginAttempts = make(map[string]int)
+---
 
-func LoginHandler(w http.ResponseWriter, r *http.Request) {
-    ip := r.RemoteAddr
-    username := r.FormValue("username")
-    key := fmt.Sprintf("%s:%s", ip, username)
+### Variante C: SSRF en integraciones con servicios de terceros (webhooks entrantes)
 
-    if loginAttempts[key] >= 5 {
-        http.Error(w, "too many attempts", http.StatusTooManyRequests)
-        return
-    }
-    if !checkPassword(username, r.FormValue("password")) {
-        loginAttempts[key]++
-        time.AfterFunc(15*time.Minute, func() { delete(loginAttempts, key) })
-        http.Error(w, "invalid credentials", http.StatusUnauthorized)
-        return
-    }
-    delete(loginAttempts, key)  // reset on success
-    // ... generar token
+```typescript
+// VULNERABLE — reenviar webhook de proveedor externo a URL interna
+@Post('/webhook/forward')
+async forwardWebhook(
+  @Body('destination') destination: string,
+  @Body('payload') payload: unknown,
+): Promise<void> {
+  // Sin validacion: destination puede ser http://internal-service:8080/admin
+  await axios.post(destination, payload);
+}
+```
+
+```typescript
+// SEGURO — validar destination con allowlist + solo POST a endpoints declarados
+const WEBHOOK_DESTINATIONS = new Set([
+  'https://crm.empresa.com/webhooks/incoming',
+  'https://slack.com/services/hooks',
+]);
+
+@Post('/webhook/forward')
+async forwardWebhook(
+  @Body('destination') destination: string,
+  @Body('payload') payload: unknown,
+): Promise<void> {
+  if (!WEBHOOK_DESTINATIONS.has(destination)) {
+    throw new BadRequestException('Destino de webhook no autorizado');
+  }
+  await axios.post(destination, payload, { maxRedirects: 0 });
 }
 ```
 
@@ -229,16 +238,17 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 ## Referencias
 
-- [OWASP A07:2021 - Identification and Authentication Failures](https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/)
-- [CWE-347: Improper Verification of Cryptographic Signature](https://cwe.mitre.org/data/definitions/347.html)
-- [CVE-2015-9235 - JWT None Algorithm Attack](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2015-9235)
-- [Auth0 - Critical Vulnerabilities in JWT Libraries](https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/)
+- [OWASP A10:2021 - SSRF](https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/)
+- [CWE-918: Server-Side Request Forgery](https://cwe.mitre.org/data/definitions/918.html)
+- [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [AWS IMDSv2 - Mitigacion de SSRF en EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 27** exige que `src/go/handlers/jwt.go` contenga:
-- `jwt.SigningMethodHMAC`
-- `os.Getenv("JWT_SECRET")`
-- La ausencia de `return []byte("secret"), nil`
+El workflow **Validate Step 28** exige que `src/typescript/src/proxy.controller.ts` contenga:
+- `ALLOWED_HOSTS`
+- `new URL(url)`
+- `maxRedirects`
+- La ausencia de `await axios.get(url);`
