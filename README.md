@@ -1,235 +1,214 @@
-# Paso 17 — Regex Injection
-**Tecnologia:** TypeScript / NestJS | **OWASP:** A03:2021 - Injection | **CWE-625**
+# Paso 18 — Sensitive Data in Logs
+**Tecnologia:** TypeScript / NestJS | **OWASP:** A02:2021 - Cryptographic Failures | **CWE-532**
 
 ---
 
 ## Que es esta vulnerabilidad?
 
-Regex Injection ocurre cuando input del usuario se usa para construir una expresion regular sin escapar sus metacaracteres. El impacto es doble:
+Sensitive Data in Logs ocurre cuando una aplicacion escribe en sus registros datos que deben permanecer confidenciales: contrasenas, tokens de autenticacion, numeros de tarjeta, PINs, claves API, codigos OTP, respuestas de seguridad o cualquier dato de identificacion personal (PII).
 
-1. **DoS via ReDoS:** el atacante puede enviar un patron con backtracking catastrofico que bloquea el event loop de Node.js (que es single-threaded). A diferencia del step 13 en Go, en Node.js un event loop bloqueado es devastador: todas las peticiones al servidor se cuelgan hasta que el regex termina.
+Los sistemas de logging centralizado (Splunk, ELK Stack, CloudWatch, Datadog, Grafana Loki) almacenan logs de muchos servicios y son accedidos por equipos de operaciones, seguridad y desarrollo. Un ingeniero con acceso al sistema de observabilidad puede ver accidentalmente (o intencionadamente) credenciales reales de usuarios.
 
-2. **Comportamiento inesperado:** metacaracteres como `.` (cualquier caracter), `*` (cero o mas), `^` y `$` pueden hacer que el regex matchee cosas que no deberia, causando falsos positivos en validaciones o bypass de filtros de seguridad.
-
-En JavaScript, `new RegExp(userInput)` acepta cualquier patron valido o invalido. Si el patron es invalido (por ejemplo `[unterminated`), lanza una excepcion que puede exponer informacion del stack trace al atacante.
+Aunque el programador no tiene intencion maliciosa, un `console.log(request.body)` o `logger.info(JSON.stringify(payload))` puede exponer contrasenas de miles de usuarios. Las brechas de datos por logs mal configurados son frecuentes y de dificil deteccion porque el log suele considerarse "seguro por estar en el backend".
 
 ---
 
 ## Donde ocurre en este codigo?
 
-**Archivo:** `src/typescript/src/search.controller.ts`
+**Archivo:** `src/typescript/src/logs.service.ts`
 
 ```typescript
 // CODIGO VULNERABLE — estado actual del ejercicio
-@Controller('products')
-export class SearchController {
-  private readonly products = ['laptop', 'phone', 'tablet', 'monitor', 'keyboard'];
+@Injectable()
+export class LogsService {
+  private readonly logger = new Logger(LogsService.name);
 
-  @Get('/search')
-  search(@Query('q') q: string): string[] {
-    const pattern = new RegExp(q, 'i');  // q del usuario como patron directo
-    return this.products.filter(p => pattern.test(p));
+  logRequest(body: unknown): void {
+    this.logger.log(JSON.stringify(body));  // serializa el body completo, incluyendo contrasenas
   }
 }
 ```
 
-Cuando `q` contiene metacaracteres o cuantificadores anidados:
-- `q=((a+)+)z`: crea un regex con backtracking catastrofico que bloquea el event loop
-- `q=[invalido`: lanza `SyntaxError: Invalid regular expression`, exponiendo el stack trace
-- `q=.`: matchea todos los productos (bypass de filtro)
-- `q=.*`: devuelve todos los resultados independientemente del input
+Si un controlador llama a `logRequest({ username: 'alice', password: 's3cr3t' })`, el log contendra:
+```
+INFO [LogsService] {"username":"alice","password":"s3cr3t"}
+```
+
+Esta linea queda persistida en el sistema de logging y es accesible para cualquier persona con acceso a los logs, para siempre.
 
 ---
 
 ## Como lo explotaria un atacante
 
-**DoS bloqueando el event loop de Node.js:**
+**Escenario 1: Insider threat — empleado con acceso a Splunk/ELK:**
 ```
-GET /products/search?q=((a%2B)%2B)z
-```
-
-Node.js tiene un solo event loop. Mientras el regex evalua el patron catastrofico, ninguna otra peticion puede ser procesada. Con 2-3 peticiones concurrentes de este tipo, el servidor queda completamente inoperativo.
-
-**Demostrar el impacto:**
-```javascript
-// En Node.js: este regex bloquea el process durante segundos
-const start = Date.now();
-new RegExp('((a+)+)z', 'i').test('a'.repeat(30) + 'X');
-console.log(`Tiempo: ${Date.now() - start}ms`);  // ~30.000ms con 30 caracteres
+SPL (Splunk): index=api sourcetype=nodejs "password"
+# Devuelve miles de registros con contrasenas en texto plano
 ```
 
-**Bypass de filtro con metacaracteres:**
-```
-GET /products/search?q=.*    # devuelve todos los productos
-GET /products/search?q=.     # devuelve todos los productos (. = cualquier caracter)
-```
+**Escenario 2: Brecha en el sistema de logging:**
+Si el atacante obtiene acceso al sistema de logging (credenciales robadas, vulnerabilidad en Kibana, S3 bucket publico), consigue un dump masivo de credenciales sin necesidad de atacar la aplicacion principal.
 
-**Error con regex invalido:**
-```
-GET /products/search?q=[unclosed
-# SyntaxError: Invalid regular expression: /[unclosed/i: Unterminated character class
-# El stack trace puede exponer rutas internas del servidor
-```
+**Escenario 3: Logs en S3 sin cifrar:**
+Muchas empresas almacenan logs en S3 para retension a largo plazo. Un bucket mal configurado puede exponer meses o anos de logs con datos sensibles.
+
+**Escenario 4: Logs en entornos de CI/CD:**
+Si los tests de integracion hacen requests con datos reales y los logs se exponen en GitHub Actions, Circle CI o similar, las contrasenas quedan en los logs publicos del build.
 
 ---
 
 ## Tu tarea: aplicar la mitigacion
 
-Modifica `src/typescript/src/search.controller.ts` para escapar metacaracteres y limitar la longitud:
+Modifica `src/typescript/src/logs.service.ts` para redactar campos sensibles antes de loguear:
 
 ```typescript
 // CODIGO SEGURO
-import { Controller, Get, Query, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 
-// Escapar todos los metacaracteres de regex en el input del usuario
-function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Los caracteres . * + ? ^ $ { } ( ) | [ ] \ son escapados con \
-  // Asi, '.' se convierte en '\.' que solo matchea un punto literal
-}
+// Conjunto de campos que nunca deben aparecer en logs
+const SENSITIVE_FIELDS = new Set([
+  'password', 'passwd', 'secret', 'token', 'apiKey', 'api_key',
+  'authorization', 'creditCard', 'cardNumber', 'cvv', 'ssn',
+  'pin', 'otp', 'privateKey', 'accessToken', 'refreshToken',
+]);
 
-@Controller('products')
-export class SearchController {
-  private readonly products = ['laptop', 'phone', 'tablet', 'monitor', 'keyboard'];
+@Injectable()
+export class LogsService {
+  private readonly logger = new Logger(LogsService.name);
 
-  @Get('/search')
-  search(@Query('q') q: string): string[] {
-    if (!q || q.length === 0) {
-      return [];
+  // Redactar campos sensibles de forma recursiva en objetos anidados
+  private redact(obj: unknown): unknown {
+    if (typeof obj !== 'object' || obj === null) return obj;
+    if (Array.isArray(obj)) return obj.map(item => this.redact(item));
+
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (SENSITIVE_FIELDS.has(key.toLowerCase())) {
+        result[key] = '[REDACTED]';
+      } else {
+        result[key] = this.redact(value);
+      }
     }
-    if (q.length > 100) {
-      throw new BadRequestException('Query demasiado larga');
-    }
+    return result;
+  }
 
-    // Escapar metacaracteres: el usuario solo puede buscar texto literal
-    const safePattern = escapeRegExp(q);
-    const pattern = new RegExp(safePattern, 'i');
-    return this.products.filter(p => pattern.test(p));
+  logRequest(body: unknown): void {
+    this.logger.log(JSON.stringify(this.redact(body)));  // body redactado
   }
 }
 ```
 
 ### Por que funciona esta mitigacion?
 
-- **`escapeRegExp`:** antepone `\` a todos los metacaracteres de regex. El input `((a+)+)z` se convierte en `\(\(a\+\)\+\)z`, que busca literalmente esa cadena de texto. No hay cuantificadores ni grupos que puedan causar backtracking.
-- **Limite de longitud `q.length > 100`:** incluso con un patron potencialmente costoso, limitar el input a 100 caracteres pone un techo al tiempo de evaluacion. Ademas, consultas de busqueda legitimas raramente necesitan mas de 100 caracteres.
-- **Validacion de input vacio:** devolver `[]` para input vacio en lugar de lanzar excepcion es mas apropiado semanticamente para un endpoint de busqueda.
+- **`SENSITIVE_FIELDS`:** lista de claves conocidas que contienen datos sensibles. Cualquier campo cuyo nombre este en esta lista sera reemplazado por `[REDACTED]` antes de serializar.
+- **`redact` recursivo:** procesa objetos anidados. Si el body tiene `{ user: { credentials: { password: 'x' } } }`, el `password` anidado tambien sera redactado.
+- **Case-insensitive (`key.toLowerCase()`):** un campo llamado `Password`, `PASSWORD` o `pAsSwOrD` tambien sera redactado. Los desarrolladores usan convenciones diferentes.
+- **Redaccion en la fuente, no en el destino:** es mejor no escribir el dato que filtrarlo despues. Los sistemas SIEM con reglas de redaccion son una segunda linea de defensa, nunca la primera.
 
 ---
 
-## Variantes de la misma categoria (Injection en motores de busqueda — mas complejas)
+## Variantes de la misma categoria (Cryptographic Failures / Data Exposure — mas complejas)
 
-### Variante A: MongoDB Operator Injection
-
-```typescript
-// VULNERABLE — query de MongoDB construida con input del usuario
-@Get('/users')
-async findUsers(@Query('role') role: string) {
-  // Si role = { "$gt": "" }, MongoDB devuelve todos los usuarios
-  // porque todos los roles son "mayor que" una cadena vacia
-  return this.userModel.find({ role: role }).exec();
-}
-```
-
-Payload: `GET /users?role[$gt]=`  
-Mongoose convierte esto a `{ role: { $gt: '' } }` si no hay proteccion, devolviendo todos los usuarios.
+### Variante A: Datos sensibles en mensajes de error
 
 ```typescript
-// SEGURO — validar tipo y usar cast explicito a string
-@Get('/users')
-async findUsers(@Query('role') role: unknown) {
-  const VALID_ROLES = ['admin', 'user', 'moderator'];
-  if (typeof role !== 'string' || !VALID_ROLES.includes(role)) {
-    throw new BadRequestException('Rol invalido');
-  }
-  return this.userModel.find({ role: String(role) }).exec();  // cast a string garantizado
-}
-```
-
----
-
-### Variante B: Elasticsearch Query Injection
-
-```typescript
-// VULNERABLE — query DSL de Elasticsearch construida con input sin sanitizar
-@Get('/search')
-async searchDocuments(@Query('q') q: string) {
-  const query = {
-    query: {
-      query_string: {
-        query: q  // query_string acepta sintaxis Lucene avanzada con OR, AND, campos
-      }
+// VULNERABLE — exponer stack trace y datos internos en respuestas de error
+@Controller('payments')
+export class PaymentsController {
+  @Post('/charge')
+  async charge(@Body() body: ChargeDto) {
+    try {
+      return await this.stripeService.charge(body);
+    } catch (error) {
+      // El error puede incluir el payload completo enviado a Stripe (con datos de tarjeta)
+      throw new HttpException(error.message, 500);  // expone info de Stripe
     }
-  };
-  return this.elastic.search({ index: 'documents', body: query });
+  }
 }
 ```
 
-Payload: `q=* OR creator:admin` devuelve documentos de todos los creadores.  
-Payload: `q=_exists_:password` enumera documentos que tienen el campo `password`.
+Si Stripe devuelve un error que incluye los datos de la peticion (numero de tarjeta, CVV), estos se propagan al cliente.
 
 ```typescript
-// SEGURO — usar match query que no interpreta sintaxis Lucene
-@Get('/search')
-async searchDocuments(@Query('q') q: string) {
-  if (q.length > 200) throw new BadRequestException('Query muy larga');
-  const query = {
-    query: {
-      match: {           // match: busqueda de texto, no interpreta sintaxis Lucene
-        content: q       // q es texto literal, no query DSL
-      }
-    }
-  };
-  return this.elastic.search({ index: 'documents', body: query });
+// SEGURO — loguear el error internamente, devolver mensaje generico al cliente
+@Post('/charge')
+async charge(@Body() body: ChargeDto) {
+  try {
+    return await this.stripeService.charge(body);
+  } catch (error) {
+    // Loguear el error completo internamente (sin datos de tarjeta en el body)
+    this.logger.error('Stripe charge failed', { errorCode: error.code });
+    // Al cliente solo un mensaje generico sin detalles internos
+    throw new HttpException('Payment processing failed', 500);
+  }
 }
 ```
 
 ---
 
-### Variante C: GraphQL Injection (Introspection y Query Abuse)
+### Variante B: JWT payload almacenado en logs
 
 ```typescript
-// VULNERABLE — campo de busqueda en GraphQL sin limite de profundidad ni complejidad
-const resolvers = {
-  Query: {
-    search: (_, { query }) => db.search(query)  // sin limite de recursion
-  }
-};
-
-// Payload de DoS via consulta profundamente anidada:
-// query { user { friends { friends { friends { friends { name } } } } } }
-// Con profundidad N, el servidor hace 4^N queries a la base de datos
+// VULNERABLE — loguear el token JWT completo
+@Get('/profile')
+async getProfile(@Headers('authorization') auth: string) {
+  this.logger.log(`Request with token: ${auth}`);  // Bearer eyJhbG...
+  const user = this.jwtService.verify(auth.replace('Bearer ', ''));
+  return user;
+}
 ```
 
-```typescript
-// SEGURO — limitar profundidad y complejidad de queries GraphQL
-import depthLimit from 'graphql-depth-limit';
-import { createComplexityLimitRule } from 'graphql-validation-complexity';
+El token JWT en los logs puede ser reutilizado por alguien con acceso a los logs para autenticarse hasta que expire.
 
-const server = new ApolloServer({
-  typeDefs,
-  resolvers,
-  validationRules: [
-    depthLimit(5),                    // maximo 5 niveles de anidamiento
-    createComplexityLimitRule(1000),  // max 1000 puntos de complejidad por query
-  ],
-});
+```typescript
+// SEGURO — loguear solo el subject del token, nunca el token completo
+@Get('/profile')
+async getProfile(@Headers('authorization') auth: string) {
+  const token = auth?.replace('Bearer ', '') || '';
+  const payload = this.jwtService.verify(token);
+  // Solo loguear el ID del usuario, nunca el token completo
+  this.logger.log(`Profile request for user: ${payload.sub}`);
+  return payload;
+}
+```
+
+---
+
+### Variante C: PII en query parameters que van a access logs
+
+```
+# VULNERABLE — datos sensibles en la URL que el servidor web registra automaticamente
+GET /api/users/search?ssn=123-45-6789&dob=1980-01-01
+```
+
+Los servidores web (Nginx, Apache, AWS ALB) registran la URL completa en access logs. El numero de seguro social va a los access logs automaticamente, sin que el desarrollador haga nada.
+
+```
+# SEGURO — datos sensibles en el cuerpo de la peticion POST, no en la URL
+POST /api/users/search
+Content-Type: application/json
+
+{"ssn": "123-45-6789", "dob": "1980-01-01"}
+
+# Y configurar el servidor para no loguear el cuerpo de la peticion
+# O usar log scrubbing en el pipeline de ingestion de logs
 ```
 
 ---
 
 ## Referencias
 
-- [OWASP A03:2021 - Injection](https://owasp.org/Top10/A03_2021-Injection/)
-- [CWE-625: Permissive Regular Expression](https://cwe.mitre.org/data/definitions/625.html)
-- [OWASP ReDoS Prevention](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
-- [MDN - Escaping in regular expressions](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions)
+- [OWASP A02:2021 - Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
+- [CWE-532: Insertion of Sensitive Information into Log File](https://cwe.mitre.org/data/definitions/532.html)
+- [OWASP Sensitive Data Exposure](https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure)
+- [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
 
 ---
 
 ## Lo que valida el workflow automaticamente
 
-El workflow **Validate Step 17** exige que `src/typescript/src/search.controller.ts` contenga:
-- `escapeRegExp`
-- El limite `q.length > 100`
-- La desaparicion de `new RegExp(q, 'i')`
+El workflow **Validate Step 18** exige que `src/typescript/src/logs.service.ts` contenga:
+- `SENSITIVE_FIELDS`
+- `[REDACTED]`
+- `this.redact(body)`
+- La ausencia de `JSON.stringify(body)`
