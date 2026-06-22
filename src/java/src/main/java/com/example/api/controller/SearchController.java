@@ -9,6 +9,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.bind.annotation.RestController;
 
+import org.springframework.web.util.HtmlUtils;
+
 @RestController
 @RequestMapping("/api/xss")
 public class SearchController {
@@ -27,6 +29,8 @@ public class SearchController {
     @GetMapping("/search")
     @ResponseBody
     public String search(@RequestParam String q) {
-        return "<html><body><h2>Resultados para: " + q + "</h2></body></html>";
+        String safeQ = HtmlUtils.htmlEscape(q);
+
+        return "<html><body><h2>Resultados para: " + safeQ + "</h2></body></html>";
     }
 }
